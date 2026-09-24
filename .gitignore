@@ -1,7 +1,12 @@
 # Root binary
 /xport
+/xport-*
 *.exe
 *.test
+
+# Local environment files
+.env
+
 
 # Keys and certificates generated during testing
 *.crt
@@ -13,3 +18,4 @@ keys/
 .sent/
 .failed/
 .staging/
+incoming/*
