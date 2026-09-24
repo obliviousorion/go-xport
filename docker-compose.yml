@@ -1,0 +1,29 @@
+services:
+  receiver:
+    build: .
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./ws/incoming:/data/incoming
+      - ./keys:/keys:ro
+    ports:
+      - "9101:9101"
+    command: >
+      xport recv -dir /data/incoming -listen 0.0.0.0:9000
+      -cert /keys/receiver.crt -key /keys/receiver.key
+      -peer-fp ${SENDER_FP} -name recv-A
+      -status 0.0.0.0:9101 -status-peer-fp ${MONITOR_FP}
+
+  sender:
+    build: .
+    depends_on:
+      - receiver
+    volumes:
+      - ./ws/outbox:/data/outbox
+      - ./keys:/keys:ro
+    ports:
+      - "9100:9100"
+    command: >
+      xport send -dir /data/outbox -addr receiver:9000
+      -cert /keys/sender.crt -key /keys/sender.key
+      -peer-fp ${RECEIVER_FP} -parallel 1 -after archive
+      -name send-A -status 0.0.0.0:9100 -status-peer-fp ${MONITOR_FP}

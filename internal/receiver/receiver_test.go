@@ -1,0 +1,173 @@
+package receiver
+
+import (
+	"bytes"
+	"crypto/tls"
+	"net"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"xport/internal/tlsutil"
+	"xport/internal/wire"
+)
+
+func TestBootCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+	stagingDir := filepath.Join(tempDir, ".staging")
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		t.Fatalf("failed to create staging dir: %v", err)
+	}
+
+	tmpFile1 := filepath.Join(stagingDir, "aborted1.tmp")
+	tmpFile2 := filepath.Join(stagingDir, "aborted2.tmp")
+	keepFile := filepath.Join(stagingDir, "important.data")
+
+	_ = os.WriteFile(tmpFile1, []byte("garbage"), 0644)
+	_ = os.WriteFile(tmpFile2, []byte("garbage"), 0644)
+	_ = os.WriteFile(keepFile, []byte("keep"), 0644)
+
+	if err := BootCleanup(tempDir); err != nil {
+		t.Fatalf("BootCleanup failed: %v", err)
+	}
+
+	if _, err := os.Stat(tmpFile1); !os.IsNotExist(err) {
+		t.Errorf("expected tmpFile1 to be deleted")
+	}
+	if _, err := os.Stat(tmpFile2); !os.IsNotExist(err) {
+		t.Errorf("expected tmpFile2 to be deleted")
+	}
+	if _, err := os.Stat(keepFile); err != nil {
+		t.Errorf("expected non-tmp file to be preserved")
+	}
+}
+
+func TestCommitBarrier(t *testing.T) {
+	tempDir := t.TempDir()
+	stagedFile, stagedPath, err := CreateStagedFile(tempDir)
+	if err != nil {
+		t.Fatalf("CreateStagedFile failed: %v", err)
+	}
+
+	content := []byte("model checkpoint shard payload")
+	if _, err := stagedFile.Write(content); err != nil {
+		t.Fatalf("failed to write to staged file: %v", err)
+	}
+
+	filename := "checkpoint-001.bin"
+	var replyBuf bytes.Buffer
+
+	if err := CommitBarrier(stagedFile, stagedPath, tempDir, filename, &replyBuf); err != nil {
+		t.Fatalf("CommitBarrier failed: %v", err)
+	}
+
+	// Verify reply is 0x00 ACK
+	if replyBuf.Len() != 1 || replyBuf.Bytes()[0] != wire.AckByte {
+		t.Fatalf("expected 0x00 ACK, got: %v", replyBuf.Bytes())
+	}
+
+	// Verify file is placed in incoming root
+	targetPath := filepath.Join(tempDir, filename)
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("committed file does not exist: %v", err)
+	}
+	if !bytes.Equal(data, content) {
+		t.Fatalf("committed file content mismatch")
+	}
+
+	// Verify staging file was renamed away
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Errorf("staging file still exists at %s", stagedPath)
+	}
+}
+
+func TestReceiverServerTransfer(t *testing.T) {
+	tempDir := t.TempDir()
+	keysDir := filepath.Join(tempDir, "keys")
+	_ = os.MkdirAll(keysDir, 0755)
+
+	recvCert := filepath.Join(keysDir, "recv.crt")
+	recvKey := filepath.Join(keysDir, "recv.key")
+	recvFP, err := tlsutil.GenerateCert("receiver", 365, recvCert, recvKey)
+	if err != nil {
+		t.Fatalf("failed to generate receiver cert: %v", err)
+	}
+
+	sendCert := filepath.Join(keysDir, "send.crt")
+	sendKey := filepath.Join(keysDir, "send.key")
+	sendFP, err := tlsutil.GenerateCert("sender", 365, sendCert, sendKey)
+	if err != nil {
+		t.Fatalf("failed to generate sender cert: %v", err)
+	}
+
+	incomingDir := filepath.Join(tempDir, "incoming")
+	_ = os.MkdirAll(incomingDir, 0755)
+
+	server := NewServer(incomingDir, "127.0.0.1:0", recvCert, recvKey, []string{sendFP}, 1024*1024*10, nil)
+	if err := server.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer server.Close()
+
+	serverAddr := server.Addr().String()
+
+	// Connect client
+	clientTLS, err := tlsutil.NewClientTLSConfig(sendCert, sendKey, []string{recvFP})
+	if err != nil {
+		t.Fatalf("client TLS config failed: %v", err)
+	}
+
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", serverAddr, clientTLS)
+	if err != nil {
+		t.Fatalf("client failed to dial server: %v", err)
+	}
+	defer conn.Close()
+
+	// Send file 1
+	filename := "shard-001.bin"
+	payload := []byte("high-speed tensor data stream")
+	if err := wire.WriteRequestHeader(conn, filename, uint64(len(payload))); err != nil {
+		t.Fatalf("WriteRequestHeader failed: %v", err)
+	}
+	if _, err := wire.SendStream(conn, bytes.NewReader(payload), uint64(len(payload))); err != nil {
+		t.Fatalf("SendStream failed: %v", err)
+	}
+	if err := wire.ReadResponse(conn); err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+
+	// Verify file received
+	committedPath := filepath.Join(incomingDir, filename)
+	data, err := os.ReadFile(committedPath)
+	if err != nil {
+		t.Fatalf("file not committed: %v", err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatalf("committed payload mismatch")
+	}
+
+	// Send file 2 on the SAME persistent connection
+	filename2 := "shard-002.bin"
+	payload2 := []byte("second tensor shard over persistent TLS connection")
+	if err := wire.WriteRequestHeader(conn, filename2, uint64(len(payload2))); err != nil {
+		t.Fatalf("WriteRequestHeader 2 failed: %v", err)
+	}
+	if _, err := wire.SendStream(conn, bytes.NewReader(payload2), uint64(len(payload2))); err != nil {
+		t.Fatalf("SendStream 2 failed: %v", err)
+	}
+	if err := wire.ReadResponse(conn); err != nil {
+		t.Fatalf("ReadResponse 2 failed: %v", err)
+	}
+
+	committedPath2 := filepath.Join(incomingDir, filename2)
+	data2, err := os.ReadFile(committedPath2)
+	if err != nil {
+		t.Fatalf("file 2 not committed: %v", err)
+	}
+	if !bytes.Equal(data2, payload2) {
+		t.Fatalf("committed payload 2 mismatch")
+	}
+}

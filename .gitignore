@@ -1,0 +1,15 @@
+# Root binary
+/xport
+*.exe
+*.test
+
+# Keys and certificates generated during testing
+*.crt
+*.key
+
+# Data directories
+ws/
+keys/
+.sent/
+.failed/
+.staging/
