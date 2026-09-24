@@ -26,8 +26,13 @@ func TestDiskStats(t *testing.T) {
 func TestSenderStateEvaluation(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 1. Initial healthy state
+	// 1. Initial healthy state (disable disk thresholds for hermetic testing)
 	tracker := NewTracker("send-test", RoleSender, tempDir, 15, 5, 2*time.Second, 0)
+	tracker.mu.Lock()
+	tracker.diskWarnPct = 0
+	tracker.diskFailPct = 0
+	tracker.mu.Unlock()
+
 	st := tracker.Evaluate()
 	if st.State != StateOK {
 		t.Fatalf("expected state OK, got %s", st.State)
@@ -53,6 +58,17 @@ func TestSenderStateEvaluation(t *testing.T) {
 	st = tracker.Evaluate()
 	if st.State != StateFail {
 		t.Fatalf("expected state FAIL when stalled with waiting files, got %s", st.State)
+	}
+
+	// 5. Verify idle period without waiting files does not trigger false FAIL
+	tracker.SetQueueCounts(0, 0)
+	tracker.RecordSuccess(1024)
+	time.Sleep(2100 * time.Millisecond) // exceeds 2s stallAfter
+	// Now a file is queued
+	tracker.SetQueueCounts(1, 0)
+	st = tracker.Evaluate()
+	if st.State == StateFail {
+		t.Fatalf("expected state not to be FAIL immediately after enqueuing file, got %s", st.State)
 	}
 }
 

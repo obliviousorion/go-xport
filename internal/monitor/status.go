@@ -92,8 +92,9 @@ type Tracker struct {
 	recentErrors []time.Time // timestamps of recent errors within 5 minutes
 
 	// Sender specific
-	waitingFiles int
-	failedFiles  int
+	waitingFiles   int
+	failedFiles    int
+	stallStartTime time.Time
 
 	// Receiver specific
 	activeConnections int
@@ -126,6 +127,11 @@ func (t *Tracker) RecordSuccess(bytes uint64) {
 	t.filesTotal++
 	t.bytesTotal += bytes
 	t.lastOkTime = time.Now()
+	if t.waitingFiles > 0 {
+		t.stallStartTime = time.Now()
+	} else {
+		t.stallStartTime = time.Time{}
+	}
 }
 
 func (t *Tracker) RecordError() {
@@ -138,6 +144,11 @@ func (t *Tracker) RecordError() {
 func (t *Tracker) SetQueueCounts(waiting, failed int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if waiting > 0 && t.stallStartTime.IsZero() {
+		t.stallStartTime = time.Now()
+	} else if waiting == 0 {
+		t.stallStartTime = time.Time{}
+	}
 	t.waitingFiles = waiting
 	t.failedFiles = failed
 }
@@ -195,10 +206,10 @@ func (t *Tracker) Evaluate() NodeStatus {
 
 	// Common disk checks
 	if disk.TotalBytes > 0 {
-		if disk.FreePercent < t.diskFailPct {
+		if t.diskFailPct > 0 && disk.FreePercent < t.diskFailPct {
 			state = StateFail
 			issues = append(issues, fmt.Sprintf("disk free (%d%%) below critical failure threshold (%d%%)", disk.FreePercent, t.diskFailPct))
-		} else if disk.FreePercent < t.diskWarnPct {
+		} else if t.diskWarnPct > 0 && disk.FreePercent < t.diskWarnPct {
 			if state != StateFail {
 				state = StateWarn
 			}
@@ -207,12 +218,12 @@ func (t *Tracker) Evaluate() NodeStatus {
 	}
 
 	if t.role == RoleSender {
-		// Sender FAIL: Files pending in queue AND no successful transfer for > stall-after duration.
-		if t.waitingFiles > 0 && t.stallAfter > 0 {
-			timeSinceOk := now.Sub(t.lastOkTime)
-			if timeSinceOk > t.stallAfter {
+		// Sender FAIL: Files pending in queue AND no progress for > stall-after duration.
+		if t.waitingFiles > 0 && t.stallAfter > 0 && !t.stallStartTime.IsZero() {
+			stallDuration := now.Sub(t.stallStartTime)
+			if stallDuration > t.stallAfter {
 				state = StateFail
-				issues = append(issues, fmt.Sprintf("stalled: %d files waiting and no success for %v (limit: %v)", t.waitingFiles, timeSinceOk.Round(time.Second), t.stallAfter))
+				issues = append(issues, fmt.Sprintf("stalled: %d files waiting and no progress for %v (limit: %v)", t.waitingFiles, stallDuration.Round(time.Second), t.stallAfter))
 			}
 		}
 
