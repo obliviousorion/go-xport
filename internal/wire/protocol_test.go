@@ -36,13 +36,19 @@ func TestValidateFilename(t *testing.T) {
 		"subdir/shard.tar",
 		"sub\\shard.tar",
 		"shard.tmp",
+		"shard.TMP",
+		"shard.Tmp",
 		"shard.part",
+		"shard.PART",
+		"shard.Part",
 		".hidden",
 		".",
 		"..",
 		"file\x00bad",
 		"file\nbad",
 		"file\rbad",
+		"bidi\u202Ebad.tar", // Bidi override
+		"zwsp\u200Bbad.tar", // Zero-width space format char
 		strings.Repeat("a", 201),
 	}
 	for _, f := range invalid {
@@ -158,6 +164,20 @@ func TestAckNackRoundTrip(t *testing.T) {
 	err := ReadResponse(&buf)
 	if err == nil || !strings.Contains(err.Error(), errMsg) {
 		t.Fatalf("expected error containing %q, got: %v", errMsg, err)
+	}
+	if !IsPermanentNack(err) {
+		t.Fatalf("expected error containing quota exceeded to be marked permanent")
+	}
+
+	// Test Transient NACK
+	buf.Reset()
+	transientMsg := "temporary network timeout"
+	if err := WriteNack(&buf, transientMsg); err != nil {
+		t.Fatalf("WriteNack failed: %v", err)
+	}
+	err = ReadResponse(&buf)
+	if IsPermanentNack(err) {
+		t.Fatalf("expected transient error not to be marked permanent")
 	}
 }
 

@@ -3,12 +3,14 @@ package sender
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -228,11 +230,41 @@ func PushFiles(ctx context.Context, targetAddr, certFile, keyFile string, allowe
 	return nil
 }
 
+// isAuthOrHandshakeError identifies errors caused by bad certificates or handshake rejection
+func isAuthOrHandshakeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "bad certificate") ||
+		strings.Contains(msg, "certificate rejected") ||
+		strings.Contains(msg, "tls: bad") ||
+		strings.Contains(msg, "handshake failure") ||
+		strings.Contains(msg, "unrecognized name") ||
+		strings.Contains(msg, "peer certificate")
+}
+
+// isConnectionClosedError identifies errors caused by a closed or dropped network connection
+func isConnectionClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "closed network connection") ||
+		strings.Contains(msg, "unexpected eof")
+}
+
 // workerLoop processes files sequentially, keeping the TLS connection persistent across files.
 func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 	defer p.wg.Done()
 
 	var conn net.Conn
+	var lastActive time.Time
 	defer func() {
 		if conn != nil {
 			_ = conn.Close()
@@ -257,6 +289,14 @@ func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 			return
 		}
 
+		// Proactive idle connection check:
+		// Receiver drops idle connections at 2 minutes (ReceiverIdleTimeout).
+		// Proactively close and re-dial if idle for >= 105 seconds to avoid broken pipe on next write.
+		if conn != nil && !lastActive.IsZero() && time.Since(lastActive) >= (wire.ReceiverIdleTimeout-15*time.Second) {
+			_ = conn.Close()
+			conn = nil
+		}
+
 		// Ensure persistent connection is active
 		if conn == nil {
 			var err error
@@ -279,15 +319,77 @@ func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 				continue
 			}
 			dialBackoff = 1 * time.Second
+			lastActive = time.Now()
 		}
 
-		// Transfer file
+		// Transfer file with transparent reconnect on stale cached connection
+		wasCachedConn := (!lastActive.IsZero() && time.Since(lastActive) > 5*time.Second)
 		err := p.transferFile(conn, item)
+		if err != nil && wasCachedConn && isConnectionClosedError(err) {
+			// Transparent retry on stale cached connection drop without burning file attempts
+			log.Printf("[sender-%d] persistent connection dropped by receiver while idle; reconnecting transparently for %s...", workerID, item.Filename)
+			_ = conn.Close()
+			var dialErr error
+			conn, dialErr = p.dialPersistent()
+			if dialErr == nil {
+				lastActive = time.Now()
+				err = p.transferFile(conn, item)
+			}
+		}
+
 		if err != nil {
-			log.Printf("[sender-%d] transfer failed for %s: %v", workerID, item.Filename, err)
 			_ = conn.Close()
 			conn = nil // Reset connection to re-dial on next attempt
 
+			// Case 1: Authentication failure (e.g. wrong peer fingerprint)
+			if isAuthOrHandshakeError(err) {
+				log.Printf("[sender-%d] AUTHENTICATION ERROR: receiver rejected sender certificate: %v (verify receiver's -peer-fp; retrying in %v)", workerID, err, dialBackoff)
+				if p.tracker != nil {
+					p.tracker.RecordError()
+				}
+				p.queue.Requeue(item) // Requeue WITHOUT burning file attempts!
+				select {
+				case <-p.stopCh:
+					return
+				case <-time.After(dialBackoff):
+				}
+				dialBackoff *= 2
+				if dialBackoff > maxDialBackoff {
+					dialBackoff = maxDialBackoff
+				}
+				continue
+			}
+
+			// Case 2: Permanent rejection (e.g. payload too large, invalid filename, collision)
+			if wire.IsPermanentNack(err) {
+				log.Printf("[sender-%d] permanent rejection for %s: %v; quarantining immediately", workerID, item.Filename, err)
+				if p.tracker != nil {
+					p.tracker.RecordError()
+				}
+				p.queue.Quarantine(item, err)
+				if p.scanner != nil {
+					p.scanner.MarkCompleted(item.Filename)
+				}
+				continue
+			}
+
+			// Case 3: Transient network drop mid-transfer
+			if isConnectionClosedError(err) {
+				log.Printf("[sender-%d] transport connection error for %s: %v; requeuing for retry", workerID, item.Filename, err)
+				if p.tracker != nil {
+					p.tracker.RecordError()
+				}
+				p.queue.Requeue(item)
+				select {
+				case <-p.stopCh:
+					return
+				case <-time.After(1 * time.Second):
+				}
+				continue
+			}
+
+			// Case 4: Poison or corrupt file error
+			log.Printf("[sender-%d] transfer failed for %s: %v", workerID, item.Filename, err)
 			if p.tracker != nil {
 				p.tracker.RecordError()
 			}
@@ -303,6 +405,9 @@ func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 			}
 			continue
 		}
+
+		lastActive = time.Now()
+		dialBackoff = 1 * time.Second
 
 		// Transfer succeeded: post-commit action
 		if postCommitErr := p.postCommit(item); postCommitErr != nil {

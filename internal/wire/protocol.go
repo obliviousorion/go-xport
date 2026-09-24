@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -23,20 +22,18 @@ const (
 	NackByte byte = 0x01
 
 	MaxFilenameLen = 200
-	HashSize       = 32 // SHA-256 raw bytes
+	HashSize       = 32          // SHA-256 raw bytes
 	BufferSize     = 1024 * 1024 // 1 MB buffer for high throughput streaming
 
 	// Deadline requirements
-	HandshakeTimeout = 10 * time.Second
-	ReadWriteTimeout = 60 * time.Second
+	HandshakeTimeout    = 10 * time.Second
+	ReadWriteTimeout    = 60 * time.Second
 	ReceiverIdleTimeout = 2 * time.Minute
 )
 
 var (
-	filenameRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`)
-
 	ErrInvalidMagic       = errors.New("invalid protocol magic header")
-	ErrInvalidFilename    = errors.New("invalid filename: must be a valid UTF-8 basename not ending in .tmp or .part, without path separators or control characters")
+	ErrInvalidFilename    = errors.New("invalid filename: must be a valid UTF-8 basename not ending in .tmp or .part, without path separators, control, or format characters")
 	ErrPayloadTooLarge    = errors.New("payload size exceeds maximum allowed size")
 	ErrChecksumMismatch   = errors.New("sha-256 checksum mismatch")
 	ErrUnexpectedResponse = errors.New("unexpected response code from receiver")
@@ -47,8 +44,8 @@ var (
 // - Basename only (reject path separators / or \)
 // - Length between 1 and MaxFilenameLen bytes
 // - Must not start with '.' (hidden files / atomic staging)
-// - Must not end in .tmp or .part
-// - Valid UTF-8 string with no unprintable control characters
+// - Must not end in .tmp or .part (case-insensitive)
+// - Valid UTF-8 string with printable characters only (rejecting control and Unicode format characters like bidi overrides)
 func ValidateFilename(name string) error {
 	if len(name) == 0 || len(name) > MaxFilenameLen {
 		return fmt.Errorf("%w: length %d must be between 1 and %d bytes", ErrInvalidFilename, len(name), MaxFilenameLen)
@@ -59,15 +56,16 @@ func ValidateFilename(name string) error {
 	if name == "." || name == ".." || strings.HasPrefix(name, ".") {
 		return fmt.Errorf("%w: hidden or directory reference names not allowed", ErrInvalidFilename)
 	}
-	if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".part") {
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".part") {
 		return fmt.Errorf("%w: cannot end with .tmp or .part", ErrInvalidFilename)
 	}
 	if !utf8.ValidString(name) {
 		return fmt.Errorf("%w: filename is not valid UTF-8", ErrInvalidFilename)
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) {
-			return fmt.Errorf("%w: unprintable control character in filename", ErrInvalidFilename)
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || !unicode.IsPrint(r) {
+			return fmt.Errorf("%w: unprintable, control, or format character in filename", ErrInvalidFilename)
 		}
 	}
 	return nil
@@ -164,8 +162,35 @@ func WriteNack(w io.Writer, msg string) error {
 	return err
 }
 
+// NackError represents an explicit negative acknowledgement from the receiver.
+type NackError struct {
+	Msg       string
+	Permanent bool
+}
+
+func (e *NackError) Error() string {
+	return fmt.Sprintf("receiver nack: %s", e.Msg)
+}
+
+// IsPermanentNack determines whether an error indicates a permanent failure that should not be retried.
+func IsPermanentNack(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nackErr *NackError
+	if errors.As(err, &nackErr) {
+		return nackErr.Permanent
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "PERM:") ||
+		strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "exceeds maximum allowed size") ||
+		strings.Contains(msg, "invalid filename") ||
+		strings.Contains(msg, "quota exceeded")
+}
+
 // ReadResponse reads the response frame from the receiver.
-// Returns nil on ACK (0x00), or an error containing the NACK message (0x01).
+// Returns nil on ACK (0x00), or a NackError on NACK (0x01).
 func ReadResponse(r io.Reader) error {
 	code := make([]byte, 1)
 	if _, err := io.ReadFull(r, code); err != nil {
@@ -184,7 +209,13 @@ func ReadResponse(r io.Reader) error {
 		if _, err := io.ReadFull(r, msgBytes); err != nil {
 			return fmt.Errorf("failed to read nack message: %w", err)
 		}
-		return fmt.Errorf("receiver nack: %s", string(msgBytes))
+		msgStr := string(msgBytes)
+		isPerm := strings.HasPrefix(msgStr, "PERM:") ||
+			strings.Contains(msgStr, "already exists") ||
+			strings.Contains(msgStr, "exceeds maximum allowed size") ||
+			strings.Contains(msgStr, "invalid filename") ||
+			strings.Contains(msgStr, "quota exceeded")
+		return &NackError{Msg: msgStr, Permanent: isPerm}
 	default:
 		return fmt.Errorf("%w: byte 0x%02x", ErrUnexpectedResponse, code[0])
 	}

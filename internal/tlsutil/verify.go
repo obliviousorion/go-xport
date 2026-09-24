@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	ErrNoPeerCert          = errors.New("no peer certificate presented")
-	ErrPeerCertNotPinned   = errors.New("peer certificate fingerprint not recognized")
-	ErrNoAllowedPeers      = errors.New("no allowed peer fingerprints configured")
+	ErrNoPeerCert        = errors.New("no peer certificate presented")
+	ErrPeerCertNotPinned = errors.New("peer certificate fingerprint not recognized")
+	ErrNoAllowedPeers    = errors.New("no allowed peer fingerprints configured")
 )
 
 // NormalizeFingerprint standardizes fingerprint strings by stripping colons,

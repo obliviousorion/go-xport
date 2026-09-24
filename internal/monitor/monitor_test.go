@@ -74,7 +74,8 @@ func TestSenderStateEvaluation(t *testing.T) {
 
 func TestServerEndpoints(t *testing.T) {
 	tempDir := t.TempDir()
-	tracker := NewTracker("node-1", RoleSender, tempDir, 15, 5, 10*time.Minute, 0)
+	// Disable disk thresholds for hermetic testing across environments with low free disk
+	tracker := NewTracker("node-1", RoleSender, tempDir, 0, 0, 10*time.Minute, 0)
 	tracker.RecordSuccess(1024)
 
 	server, err := NewServer(tracker, "127.0.0.1:0", "", "", "")
@@ -162,5 +163,30 @@ func TestParseTargets(t *testing.T) {
 	}
 	if targets[1].Address != "127.0.0.1:9101" || targets[1].Fingerprint != "" {
 		t.Errorf("unexpected target 1: %+v", targets[1])
+	}
+}
+
+func TestDiskMinFreeThreshold(t *testing.T) {
+	tempDir := t.TempDir()
+	stats, err := GetDiskStats(tempDir)
+	if err != nil {
+		t.Fatalf("GetDiskStats failed: %v", err)
+	}
+
+	// Case 1: Percent indicates fail, but free bytes exceed minFree -> should NOT fail
+	tracker := NewTracker("node-minfree", RoleSender, tempDir, 0, 100, 10*time.Minute, 0)
+	if stats.FreeBytes > 1024 {
+		tracker.SetDiskMinFree(stats.FreeBytes / 2) // We have more free space than minFree threshold
+		st := tracker.Evaluate()
+		if st.State == StateFail {
+			t.Fatalf("expected state not to be FAIL when free space exceeds minFree floor")
+		}
+	}
+
+	// Case 2: Free bytes are below minFree threshold -> should fail
+	tracker.SetDiskMinFree(stats.FreeBytes + 1024*1024*1024) // minFree is higher than current free space
+	st := tracker.Evaluate()
+	if st.State != StateFail {
+		t.Fatalf("expected state to be FAIL when free space is below minFree floor, got %s", st.State)
 	}
 }

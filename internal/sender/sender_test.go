@@ -342,3 +342,123 @@ func TestPushFilesSpacesUnicodeAndDirectory(t *testing.T) {
 		t.Fatalf("received tar archive is empty")
 	}
 }
+
+func TestScannerIgnoresSymlinks(t *testing.T) {
+	tempDir := t.TempDir()
+	outboxDir := filepath.Join(tempDir, "outbox")
+	_ = os.MkdirAll(outboxDir, 0755)
+
+	queue := NewQueue(outboxDir, 10, nil)
+	scanner := NewScanner(outboxDir, 50*time.Millisecond, queue)
+
+	// Create sensitive target file outside outbox
+	secretFile := filepath.Join(tempDir, "secret.key")
+	_ = os.WriteFile(secretFile, []byte("super secret data"), 0600)
+
+	// Create symlink inside outbox pointing to secret file
+	symlinkPath := filepath.Join(outboxDir, "leak.txt")
+	if err := os.Symlink(secretFile, symlinkPath); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+
+	// Two consecutive scans
+	scanner.scanOnce()
+	scanner.scanOnce()
+
+	// Assert symlink was ignored and not queued
+	if queue.Len() != 0 {
+		t.Fatalf("security violation: symlink in outbox was queued (%d items in queue)", queue.Len())
+	}
+}
+
+func TestMismatchedFingerprintDoesNotQuarantine(t *testing.T) {
+	tempDir := t.TempDir()
+	keysDir := filepath.Join(tempDir, "keys")
+	_ = os.MkdirAll(keysDir, 0755)
+
+	recvCert := filepath.Join(keysDir, "recv.crt")
+	recvKey := filepath.Join(keysDir, "recv.key")
+	recvFP, _ := tlsutil.GenerateCert("receiver", 1, recvCert, recvKey)
+
+	sendCert := filepath.Join(keysDir, "send.crt")
+	sendKey := filepath.Join(keysDir, "send.key")
+	_, _ = tlsutil.GenerateCert("sender", 1, sendCert, sendKey)
+
+	// Receiver only permits a completely wrong fingerprint
+	wrongFP := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	incomingDir := filepath.Join(tempDir, "incoming")
+	recvServer := receiver.NewServer(incomingDir, "127.0.0.1:0", recvCert, recvKey, []string{wrongFP}, 1024*1024, nil)
+	if err := recvServer.Start(); err != nil {
+		t.Fatalf("recvServer.Start failed: %v", err)
+	}
+	defer recvServer.Close()
+
+	outboxDir := filepath.Join(tempDir, "outbox")
+	_ = os.MkdirAll(outboxDir, 0755)
+
+	// Create test file in outbox
+	testFile := filepath.Join(outboxDir, "important.bin")
+	_ = os.WriteFile(testFile, []byte("valuable user data"), 0644)
+
+	queue := NewQueue(outboxDir, 3, nil) // Low maxAttempts = 3 to catch quarantine quickly
+	item := FileItem{
+		Filename: "important.bin",
+		Path:     testFile,
+		Size:     18,
+		ModTime:  time.Now(),
+	}
+	queue.Push(item)
+
+	pool := NewClientPool(outboxDir, recvServer.Addr().String(), sendCert, sendKey, []string{recvFP}, 1, "archive", queue, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	pool.Start(ctx)
+	<-ctx.Done()
+	pool.Stop()
+
+	// Verify file was NEVER quarantined to .failed/
+	failedPath := filepath.Join(outboxDir, ".failed", "important.bin")
+	if _, err := os.Stat(failedPath); !os.IsNotExist(err) {
+		t.Fatalf("data loss bug: file was quarantined to .failed/ due to TLS fingerprint mismatch")
+	}
+
+	// Verify original file still exists in outbox
+	if _, err := os.Stat(testFile); err != nil {
+		t.Fatalf("original file missing from outbox: %v", err)
+	}
+}
+
+func TestPermanentNackImmediateQuarantine(t *testing.T) {
+	tempDir := t.TempDir()
+	outboxDir := filepath.Join(tempDir, "outbox")
+	_ = os.MkdirAll(outboxDir, 0755)
+
+	queue := NewQueue(outboxDir, 10, nil)
+
+	file1 := filepath.Join(outboxDir, "bad.tar")
+	_ = os.WriteFile(file1, []byte("bad1"), 0644)
+	item1 := FileItem{Filename: "bad.tar", Path: file1, Size: 4, ModTime: time.Now()}
+
+	// Immediate quarantine on permanent error
+	permErr := errors.New("PERM: payload size exceeds maximum allowed size")
+	queue.Quarantine(item1, permErr)
+
+	// Verify placed in .failed/
+	failed1 := filepath.Join(outboxDir, ".failed", "bad.tar")
+	if _, err := os.Stat(failed1); err != nil {
+		t.Fatalf("file not found in .failed/: %v", err)
+	}
+
+	// Test collision safety: second quarantine of same name must not overwrite
+	file2 := filepath.Join(outboxDir, "bad.tar")
+	_ = os.WriteFile(file2, []byte("bad2"), 0644)
+	item2 := FileItem{Filename: "bad.tar", Path: file2, Size: 4, ModTime: time.Now()}
+	queue.Quarantine(item2, permErr)
+
+	// Check that both files exist in .failed/
+	entries, _ := os.ReadDir(filepath.Join(outboxDir, ".failed"))
+	if len(entries) < 2 {
+		t.Fatalf("expected at least 2 entries in .failed/ due to collision avoidance, got %d", len(entries))
+	}
+}

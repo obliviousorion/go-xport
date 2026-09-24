@@ -14,12 +14,16 @@ go build -o xport ./cmd/xport
 
 ## Two-Device Transfer Guide
 
-### Phase 0: Clean Slate (Run on Both PCs)
+### Phase 0: Workspace Setup
+
+If initializing a fresh environment (ensure you have backed up any existing data):
 
 ```bash
-# Kill any running xport instances and remove old directories
-pkill -f xport || true
-rm -rf keys incoming outbox
+# Gracefully stop any running xport instances:
+pkill -x xport 2>/dev/null || true
+
+# Prepare clean workspace directories:
+mkdir -p keys incoming outbox
 ```
 
 ---
@@ -169,8 +173,8 @@ Instead of running continuous sender daemons, you can transfer files or entire d
 |---|---|---|
 | `keygen` | `-name <prefix>`, `-days <int>` | Generate ECDSA P-256 keypair and print SHA-256 fingerprint |
 | `push` | `-addr <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-timeout <duration>` | Ad-hoc push files or directories directly to receiver |
-| `recv` | `-dir <path>`, `-listen <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-auto-extract`, `-collision <rename\|reject\|overwrite>` | Run receiver daemon with mTLS and atomic commit |
-| `send` | `-dir <path>`, `-addr <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-after <archive\|delete>` | Watch directory and stream files to receiver |
+| `recv` | `-dir <path>`, `-listen <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-auto-extract`, `-collision <rename\|reject\|overwrite>`, `-disk-min-free <size>` | Run receiver daemon with mTLS, atomic commit, and disk quotas |
+| `send` | `-dir <path>`, `-addr <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-after <archive\|delete>`, `-disk-min-free <size>` | Watch directory and stream files to receiver |
 | `monitor` | `-targets <addr@fp,...>`, `-cert <path>`, `-key <path>`, `-watch <interval>` | Poll node diagnostics and render terminal dashboard |
 
 ---

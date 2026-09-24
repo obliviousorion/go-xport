@@ -4,9 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,6 +132,80 @@ func TestCommitBarrierCollision(t *testing.T) {
 	data, _ = os.ReadFile(origPath)
 	if string(data) != "overwritten" {
 		t.Fatalf("expected overwritten content, got: %s", string(data))
+	}
+}
+
+func TestCommitBarrierConcurrentCollisionRace(t *testing.T) {
+	tempDir := t.TempDir()
+	filename := "shared-resource.bin"
+	concurrency := 50
+	var wg sync.WaitGroup
+	var successCount int32
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			stagedFile, stagedPath, err := CreateStagedFile(tempDir)
+			if err != nil {
+				return
+			}
+			payload := []byte(fmt.Sprintf("worker-%d-data", workerID))
+			_, _ = stagedFile.Write(payload)
+
+			var replyBuf bytes.Buffer
+			_, err = CommitBarrier(stagedFile, stagedPath, tempDir, filename, "reject", false, &replyBuf)
+			if err == nil {
+				atomic.AddInt32(&successCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 success under concurrent reject policy, got %d", successCount)
+	}
+
+	destPath := filepath.Join(tempDir, filename)
+	data, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("failed to read destination file: %v", err)
+	}
+	if !strings.HasPrefix(string(data), "worker-") {
+		t.Fatalf("unexpected content in destination file: %s", string(data))
+	}
+}
+
+func TestTarDecompressionBombDefense(t *testing.T) {
+	tempDir := t.TempDir()
+	tarFile := filepath.Join(tempDir, "bomb.tar")
+	destDir := filepath.Join(tempDir, "extracted")
+
+	f, err := os.Create(tarFile)
+	if err != nil {
+		t.Fatalf("failed to create tar file: %v", err)
+	}
+	tw := tar.NewWriter(f)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "bomb.txt",
+		Mode:     0644,
+		Size:     100 * 1024 * 1024, // Claims 100MB
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	// Write dummy data
+	_, _ = tw.Write(make([]byte, 1024))
+	_ = tw.Close()
+	_ = f.Close()
+
+	// Enforce 50KB quota
+	err = ExtractTarWithLimit(tarFile, destDir, 50*1024)
+	if err == nil {
+		t.Fatalf("expected ExtractTarWithLimit to fail due to quota exceeded, got nil")
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Fatalf("expected quota exceeded error, got: %v", err)
 	}
 }
 

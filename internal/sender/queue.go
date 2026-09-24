@@ -1,11 +1,13 @@
 package sender
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"xport/internal/monitor"
 )
@@ -147,6 +149,42 @@ func (q *Queue) RecordSuccess(filename string) {
 // RecordFailure increments attempts for the item. If attempts reach maxAttempts,
 // the file is quarantined to <dir>/.failed/<filename>. Otherwise, it is requeued.
 // Returns true if quarantined, false if requeued for retry.
+// Quarantine immediately moves an item to .failed/ without incrementing failure attempts
+// (used for permanent non-retryable rejections like file too large or invalid filename).
+func (q *Queue) Quarantine(item FileItem, reason error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.quarantineLocked(item, reason, 0)
+}
+
+func (q *Queue) quarantineLocked(item FileItem, reason error, count int) {
+	failedDir := filepath.Join(q.watchDir, ".failed")
+	if err := os.MkdirAll(failedDir, 0755); err != nil {
+		log.Printf("[queue] failed to create .failed dir: %v", err)
+	}
+	failedPath := filepath.Join(failedDir, item.Filename)
+	if _, err := os.Stat(failedPath); err == nil {
+		failedPath = filepath.Join(failedDir, fmt.Sprintf("%s.%d", item.Filename, time.Now().UnixNano()))
+	}
+	err := os.Rename(item.Path, failedPath)
+	if err != nil {
+		log.Printf("[queue] error quarantining %s to .failed/: %v", item.Filename, err)
+	} else {
+		if count > 0 {
+			log.Printf("[queue] WARN: file %s reached %d failed attempts (%v); quarantined to .failed/%s", item.Filename, count, reason, filepath.Base(failedPath))
+		} else {
+			log.Printf("[queue] WARN: file %s permanently rejected (%v); quarantined to .failed/%s", item.Filename, reason, filepath.Base(failedPath))
+		}
+	}
+
+	delete(q.attempts, item.Filename)
+	delete(q.inQueue, item.Filename)
+	q.updateFailedCount()
+}
+
+// RecordFailure increments attempts for the item. If attempts reach maxAttempts,
+// the file is quarantined to <dir>/.failed/<filename>. Otherwise, it is requeued.
+// Returns true if quarantined, false if requeued for retry.
 func (q *Queue) RecordFailure(item FileItem, reason error) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -155,22 +193,7 @@ func (q *Queue) RecordFailure(item FileItem, reason error) bool {
 	count := q.attempts[item.Filename]
 
 	if count >= q.maxAttempts {
-		// Quarantine to <dir>/.failed/<filename>
-		failedDir := filepath.Join(q.watchDir, ".failed")
-		if err := os.MkdirAll(failedDir, 0755); err != nil {
-			log.Printf("[queue] failed to create .failed dir: %v", err)
-		}
-		failedPath := filepath.Join(failedDir, item.Filename)
-		err := os.Rename(item.Path, failedPath)
-		if err != nil {
-			log.Printf("[queue] error quarantining %s to .failed/: %v", item.Filename, err)
-		} else {
-			log.Printf("[queue] WARN: file %s reached %d failed attempts (%v); quarantined to .failed/", item.Filename, count, reason)
-		}
-
-		delete(q.attempts, item.Filename)
-		delete(q.inQueue, item.Filename)
-		q.updateFailedCount()
+		q.quarantineLocked(item, reason, count)
 		return true
 	}
 

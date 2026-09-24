@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // countWriter counts the number of bytes written to it.
@@ -45,7 +46,25 @@ func CalculateTarSize(dirPath string) (uint64, error) {
 			return nil
 		}
 
-		hdr, err := tar.FileInfoHeader(info, "")
+		var linkTarget string
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return nil // Skip unreadable symlink
+			}
+			resolved := target
+			if !filepath.IsAbs(target) {
+				resolved = filepath.Join(filepath.Dir(path), target)
+			}
+			rel, err := filepath.Rel(dirPath, resolved)
+			if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+				// Symlink escapes root directory: skip for security
+				return nil
+			}
+			linkTarget = target
+		}
+
+		hdr, err := tar.FileInfoHeader(info, linkTarget)
 		if err != nil {
 			return fmt.Errorf("failed to create tar header for %s: %w", path, err)
 		}
@@ -100,7 +119,25 @@ func StreamTar(dirPath string) (io.ReadCloser, error) {
 				return nil
 			}
 
-			hdr, err := tar.FileInfoHeader(info, "")
+			var linkTarget string
+			if info.Mode()&os.ModeSymlink != 0 {
+				target, err := os.Readlink(path)
+				if err != nil {
+					return nil // Skip unreadable symlink
+				}
+				resolved := target
+				if !filepath.IsAbs(target) {
+					resolved = filepath.Join(filepath.Dir(path), target)
+				}
+				rel, err := filepath.Rel(dirPath, resolved)
+				if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+					// Symlink escapes root directory: skip for security
+					return nil
+				}
+				linkTarget = target
+			}
+
+			hdr, err := tar.FileInfoHeader(info, linkTarget)
 			if err != nil {
 				return fmt.Errorf("header error for %s: %w", path, err)
 			}

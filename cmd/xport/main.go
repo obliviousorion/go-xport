@@ -101,14 +101,20 @@ func runSend(args []string) {
 	statusAddr := fs.String("status", "127.0.0.1:9100", "Bind address for health/metrics HTTP listener")
 	statusPeerFP := fs.String("status-peer-fp", "", "Pinned certificate fingerprint of central monitor")
 	stallAfter := fs.Duration("stall-after", 2*time.Minute, "Inactivity threshold with pending files before FAIL state")
-	diskWarnPct := fs.Int("disk-warn-pct", 15, "Free space warning threshold")
-	diskFailPct := fs.Int("disk-fail-pct", 5, "Free space critical failure threshold")
+	diskWarnPct := fs.Int("disk-warn-pct", 15, "Free space warning threshold in percent (0 to disable)")
+	diskFailPct := fs.Int("disk-fail-pct", 5, "Free space critical failure threshold in percent (0 to disable)")
+	diskMinFreeStr := fs.String("disk-min-free", "0", "Absolute free space floor (e.g. 1GiB; 0 to evaluate percentage only)")
 	_ = fs.Parse(args)
 
 	if *addr == "" || *cert == "" || *key == "" || *peerFP == "" {
 		fmt.Fprintf(os.Stderr, "error: -addr, -cert, -key, and -peer-fp are required flags for send\n")
 		fs.Usage()
 		os.Exit(2)
+	}
+
+	diskMinFree, err := wire.ParseByteSize(*diskMinFreeStr)
+	if err != nil {
+		log.Fatalf("invalid -disk-min-free %q: %v", *diskMinFreeStr, err)
 	}
 
 	if err := os.MkdirAll(*dir, 0755); err != nil {
@@ -121,6 +127,7 @@ func runSend(args []string) {
 	}
 
 	tracker := monitor.NewTracker(*name, monitor.RoleSender, *dir, *diskWarnPct, *diskFailPct, *stallAfter, 0)
+	tracker.SetDiskMinFree(diskMinFree)
 
 	// Status HTTP/TLS server
 	statusServer, err := monitor.NewServer(tracker, *statusAddr, *cert, *key, *statusPeerFP)
@@ -167,8 +174,9 @@ func runRecv(args []string) {
 	statusAddr := fs.String("status", "127.0.0.1:9101", "Bind address for health/metrics HTTP listener")
 	statusPeerFP := fs.String("status-peer-fp", "", "Pinned certificate fingerprint of central monitor")
 	staleAfter := fs.Duration("stale-after", 0, "Duration without commits before WARN (0 = disabled)")
-	diskWarnPct := fs.Int("disk-warn-pct", 15, "Free space warning threshold")
-	diskFailPct := fs.Int("disk-fail-pct", 5, "Free space critical failure threshold")
+	diskWarnPct := fs.Int("disk-warn-pct", 15, "Free space warning threshold in percent (0 to disable)")
+	diskFailPct := fs.Int("disk-fail-pct", 5, "Free space critical failure threshold in percent (0 to disable)")
+	diskMinFreeStr := fs.String("disk-min-free", "0", "Absolute free space floor (e.g. 1GiB; 0 to evaluate percentage only)")
 	collision := fs.String("collision", "rename", "Collision policy if destination file exists: rename, reject, overwrite")
 	autoExtract := fs.Bool("auto-extract", false, "Automatically extract received .tar archives into directories")
 	_ = fs.Parse(args)
@@ -177,6 +185,11 @@ func runRecv(args []string) {
 		fmt.Fprintf(os.Stderr, "error: -cert, -key, and -peer-fp are required flags for recv\n")
 		fs.Usage()
 		os.Exit(2)
+	}
+
+	diskMinFree, err := wire.ParseByteSize(*diskMinFreeStr)
+	if err != nil {
+		log.Fatalf("invalid -disk-min-free %q: %v", *diskMinFreeStr, err)
 	}
 
 	maxSize, err := wire.ParseByteSize(*maxSizeStr)
@@ -194,6 +207,7 @@ func runRecv(args []string) {
 	}
 
 	tracker := monitor.NewTracker(*name, monitor.RoleReceiver, *dir, *diskWarnPct, *diskFailPct, 0, *staleAfter)
+	tracker.SetDiskMinFree(diskMinFree)
 
 	// Status HTTP/TLS server
 	statusServer, err := monitor.NewServer(tracker, *statusAddr, *cert, *key, *statusPeerFP)

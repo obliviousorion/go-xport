@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,19 +19,19 @@ import (
 )
 
 type Server struct {
-	incomingDir       string
-	listenAddr        string
-	certFile          string
-	keyFile           string
-	allowedSenderFPs  []string
-	maxSize           uint64
-	collisionPolicy   string
-	autoExtract       bool
-	tracker           *monitor.Tracker
-	listener          net.Listener
-	activeConnCount   int32
-	stopCh            chan struct{}
-	wg                sync.WaitGroup
+	incomingDir      string
+	listenAddr       string
+	certFile         string
+	keyFile          string
+	allowedSenderFPs []string
+	maxSize          uint64
+	collisionPolicy  string
+	autoExtract      bool
+	tracker          *monitor.Tracker
+	listener         net.Listener
+	activeConnCount  int32
+	stopCh           chan struct{}
+	wg               sync.WaitGroup
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -109,6 +110,8 @@ func (s *Server) Addr() net.Addr {
 func (s *Server) acceptLoop() {
 	defer s.wg.Done()
 
+	var tempDelay time.Duration
+
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -120,9 +123,23 @@ func (s *Server) acceptLoop() {
 				if s.tracker != nil {
 					s.tracker.RecordError()
 				}
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				select {
+				case <-time.After(tempDelay):
+				case <-s.stopCh:
+					return
+				}
 				continue
 			}
 		}
+		tempDelay = 0
 
 		s.mu.Lock()
 		s.conns[conn] = struct{}{}
@@ -190,7 +207,7 @@ func (s *Server) handleConnection(c net.Conn) {
 
 			// Protocol violation or max-size exceeded: send NACK and close connection
 			log.Printf("[receiver] header error: %v", err)
-			_ = wire.WriteNack(c, err.Error())
+			_ = wire.WriteNack(c, sanitizeNackMessage(err, "invalid header"))
 			if s.tracker != nil {
 				s.tracker.RecordError()
 			}
@@ -204,7 +221,7 @@ func (s *Server) handleConnection(c net.Conn) {
 		stagedFile, stagedPath, err := CreateStagedFile(s.incomingDir)
 		if err != nil {
 			log.Printf("[receiver] staging create error: %v", err)
-			_ = wire.WriteNack(deadlineConn, fmt.Sprintf("internal error creating staging file: %v", err))
+			_ = wire.WriteNack(deadlineConn, sanitizeNackMessage(err, "internal staging error"))
 			if s.tracker != nil {
 				s.tracker.RecordError()
 			}
@@ -217,7 +234,7 @@ func (s *Server) handleConnection(c net.Conn) {
 			log.Printf("[receiver] streaming error for %s: %v", filename, err)
 			_ = stagedFile.Close()
 			_ = os.Remove(stagedPath)
-			_ = wire.WriteNack(deadlineConn, fmt.Sprintf("stream failure: %v", err))
+			_ = wire.WriteNack(deadlineConn, sanitizeNackMessage(err, "stream failure"))
 			if s.tracker != nil {
 				s.tracker.RecordError()
 			}
@@ -227,14 +244,14 @@ func (s *Server) handleConnection(c net.Conn) {
 		// Execute strict durability barrier:
 		// 1. stagedFile.Sync()
 		// 2. stagedFile.Close()
-		// 3. os.Rename(stagedPath, targetPath)
+		// 3. Atomically place into destination
 		// 4. dir.Sync()
-		// 5. If autoExtract, extract .tar
+		// 5. If autoExtract, extract .tar with expansion limits and fsync
 		// 6. Send 0x00 ACK
 		_, err = CommitBarrier(stagedFile, stagedPath, s.incomingDir, filename, s.collisionPolicy, s.autoExtract, deadlineConn)
 		if err != nil {
 			log.Printf("[receiver] commit barrier error for %s: %v", filename, err)
-			_ = wire.WriteNack(deadlineConn, fmt.Sprintf("commit barrier failure: %v", err))
+			_ = wire.WriteNack(deadlineConn, sanitizeNackMessage(err, "commit barrier failure"))
 			if s.tracker != nil {
 				s.tracker.RecordError()
 			}
@@ -245,4 +262,35 @@ func (s *Server) handleConnection(c net.Conn) {
 			s.tracker.RecordSuccess(payloadSize)
 		}
 	}
+}
+
+// sanitizeNackMessage strips sensitive local server paths from error strings
+// and returns high-level diagnostic reason for the sender.
+func sanitizeNackMessage(err error, fallbackCategory string) string {
+	if err == nil {
+		return fallbackCategory
+	}
+	msg := err.Error()
+	if strings.HasPrefix(msg, "PERM:") {
+		return msg
+	}
+	if strings.Contains(msg, "already exists") {
+		return "PERM: collision: file already exists in destination"
+	}
+	if strings.Contains(msg, "quota exceeded") {
+		return "PERM: extraction quota exceeded"
+	}
+	if strings.Contains(msg, "exceeds maximum allowed size") {
+		return "PERM: payload size exceeds maximum allowed size"
+	}
+	if strings.Contains(msg, "invalid filename") {
+		return "PERM: invalid filename"
+	}
+	if strings.Contains(msg, "sha-256 checksum mismatch") {
+		return "stream failure: checksum mismatch"
+	}
+	if strings.Contains(msg, "unexpected EOF") {
+		return "stream failure: short read"
+	}
+	return fallbackCategory
 }

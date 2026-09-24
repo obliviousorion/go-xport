@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -27,62 +26,48 @@ const (
 
 // DiskStats represents filesystem capacity metrics.
 type DiskStats struct {
-	TotalBytes   uint64 `json:"total_bytes"`
-	FreeBytes    uint64 `json:"free_bytes"`
-	FreePercent  int    `json:"free_percent"`
+	TotalBytes  uint64 `json:"total_bytes"`
+	FreeBytes   uint64 `json:"free_bytes"`
+	FreePercent int    `json:"free_percent"`
 }
 
-// GetDiskStats uses standard library syscall.Statfs (stat.Bavail) for zero-dependency Linux disk calculation.
+// GetDiskStats uses platform-specific system calls (Statfs on Unix, GetDiskFreeSpaceExW on Windows)
+// for zero-dependency disk calculation.
 func GetDiskStats(path string) (DiskStats, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return DiskStats{}, fmt.Errorf("statfs %s: %w", path, err)
-	}
-
-	freeBytes := stat.Bavail * uint64(stat.Bsize)
-	totalBytes := stat.Blocks * uint64(stat.Bsize)
-	freePct := 0
-	if totalBytes > 0 {
-		freePct = int((float64(freeBytes) / float64(totalBytes)) * 100)
-	}
-
-	return DiskStats{
-		TotalBytes:  totalBytes,
-		FreeBytes:   freeBytes,
-		FreePercent: freePct,
-	}, nil
+	return getPlatformDiskStats(path)
 }
 
 // NodeStatus is the JSON structure served at /status.
 type NodeStatus struct {
-	NodeID          string      `json:"node_id"`
-	Role            Role        `json:"role"`
-	State           HealthState `json:"state"`
-	ActiveIssues    []string    `json:"active_issues"`
-	UptimeSeconds   int64       `json:"uptime_seconds"`
-	FilesTotal      uint64      `json:"files_total"`
-	BytesTotal      uint64      `json:"bytes_total"`
-	ErrorsTotal     uint64      `json:"errors_total"`
-	WaitingFiles    int         `json:"waiting_files"`
-	FailedFiles     int         `json:"failed_files"`
-	LastOkSeconds   int64       `json:"last_ok_seconds"`
-	Disk            DiskStats   `json:"disk"`
+	NodeID        string      `json:"node_id"`
+	Role          Role        `json:"role"`
+	State         HealthState `json:"state"`
+	ActiveIssues  []string    `json:"active_issues"`
+	UptimeSeconds int64       `json:"uptime_seconds"`
+	FilesTotal    uint64      `json:"files_total"`
+	BytesTotal    uint64      `json:"bytes_total"`
+	ErrorsTotal   uint64      `json:"errors_total"`
+	WaitingFiles  int         `json:"waiting_files"`
+	FailedFiles   int         `json:"failed_files"`
+	LastOkSeconds int64       `json:"last_ok_seconds"`
+	Disk          DiskStats   `json:"disk"`
 }
 
 // Tracker coordinates state tracking and evaluation for a node.
 type Tracker struct {
 	mu sync.RWMutex
 
-	nodeID      string
-	role        Role
-	watchDir    string
-	startTime   time.Time
+	nodeID    string
+	role      Role
+	watchDir  string
+	startTime time.Time
 
 	// Thresholds
-	diskWarnPct int
-	diskFailPct int
-	stallAfter  time.Duration
-	staleAfter  time.Duration
+	diskWarnPct      int
+	diskFailPct      int
+	diskMinFreeBytes uint64
+	stallAfter       time.Duration
+	staleAfter       time.Duration
 
 	// Metrics
 	filesTotal   uint64
@@ -101,24 +86,31 @@ type Tracker struct {
 }
 
 func NewTracker(nodeID string, role Role, watchDir string, diskWarnPct, diskFailPct int, stallAfter, staleAfter time.Duration) *Tracker {
-	if diskWarnPct <= 0 {
+	if diskWarnPct < 0 {
 		diskWarnPct = 15
 	}
-	if diskFailPct <= 0 {
+	if diskFailPct < 0 {
 		diskFailPct = 5
 	}
 
 	return &Tracker{
-		nodeID:      nodeID,
-		role:        role,
-		watchDir:    watchDir,
-		startTime:   time.Now(),
-		diskWarnPct: diskWarnPct,
-		diskFailPct: diskFailPct,
-		stallAfter:  stallAfter,
-		staleAfter:  staleAfter,
-		lastOkTime:  time.Now(),
+		nodeID:           nodeID,
+		role:             role,
+		watchDir:         watchDir,
+		startTime:        time.Now(),
+		diskWarnPct:      diskWarnPct,
+		diskFailPct:      diskFailPct,
+		diskMinFreeBytes: 0,
+		stallAfter:       stallAfter,
+		staleAfter:       staleAfter,
+		lastOkTime:       time.Now(),
 	}
+}
+
+func (t *Tracker) SetDiskMinFree(bytes uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.diskMinFreeBytes = bytes
 }
 
 func (t *Tracker) RecordSuccess(bytes uint64) {
@@ -205,15 +197,17 @@ func (t *Tracker) Evaluate() NodeStatus {
 	var issues []string
 
 	// Common disk checks
+	// Common disk checks
 	if disk.TotalBytes > 0 {
-		if t.diskFailPct > 0 && disk.FreePercent < t.diskFailPct {
+		isBelowMinFree := (t.diskMinFreeBytes == 0 || disk.FreeBytes < t.diskMinFreeBytes)
+		if t.diskFailPct > 0 && disk.FreePercent < t.diskFailPct && isBelowMinFree {
 			state = StateFail
-			issues = append(issues, fmt.Sprintf("disk free (%d%%) below critical failure threshold (%d%%)", disk.FreePercent, t.diskFailPct))
-		} else if t.diskWarnPct > 0 && disk.FreePercent < t.diskWarnPct {
+			issues = append(issues, fmt.Sprintf("disk free (%d%%, %s) below critical failure threshold (%d%%)", disk.FreePercent, FormatBytes(disk.FreeBytes), t.diskFailPct))
+		} else if t.diskWarnPct > 0 && disk.FreePercent < t.diskWarnPct && isBelowMinFree {
 			if state != StateFail {
 				state = StateWarn
 			}
-			issues = append(issues, fmt.Sprintf("disk free (%d%%) below warning threshold (%d%%)", disk.FreePercent, t.diskWarnPct))
+			issues = append(issues, fmt.Sprintf("disk free (%d%%, %s) below warning threshold (%d%%)", disk.FreePercent, FormatBytes(disk.FreeBytes), t.diskWarnPct))
 		}
 	}
 

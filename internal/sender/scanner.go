@@ -99,6 +99,19 @@ func (s *Scanner) scanOnce() {
 			continue
 		}
 
+		// Security: reject symlinks in watch directory to prevent arbitrary file exfiltration
+		if entry.Type()&os.ModeSymlink != 0 {
+			if _, warned := s.ignoredWarned[name]; !warned {
+				log.Printf("[scanner] SECURITY: ignoring symlink %q in watch directory to prevent exfiltration", name)
+				s.ignoredWarned[name] = struct{}{}
+			}
+			currentFiles[name] = struct{}{}
+			continue
+		}
+		if !entry.Type().IsRegular() {
+			continue
+		}
+
 		// Ignore hidden files (starts with .)
 		if strings.HasPrefix(name, ".") {
 			continue

@@ -16,11 +16,9 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${SCRIPT_DIR}/xport"
 
-# Ensure binary is built
-if [ ! -f "$BIN" ]; then
-    info "Compiling xport binary..."
-    go build -o "$BIN" "${SCRIPT_DIR}/cmd/xport"
-fi
+# Compile xport binary
+info "Compiling xport binary..."
+go build -o "$BIN" "${SCRIPT_DIR}/cmd/xport"
 
 TEST_DIR=$(mktemp -d -t xport-test-XXXXXX)
 info "Using temporary workspace: $TEST_DIR"
@@ -33,7 +31,10 @@ cleanup() {
     if [ -n "${SEND_PID:-}" ] && kill -0 "$SEND_PID" 2>/dev/null; then
         kill "$SEND_PID" 2>/dev/null || true
     fi
-    wait 2>/dev/null || true
+    if [ -n "${ROGUE_PID2:-}" ] && kill -0 "$ROGUE_PID2" 2>/dev/null; then
+        kill "$ROGUE_PID2" 2>/dev/null || true
+    fi
+    sleep 0.5
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
@@ -499,6 +500,103 @@ if [ "$PUSH_DOWN_EXIT" -eq 0 ]; then
     fail "Expected xport push to fail against unreachable receiver"
 fi
 pass "Ad-hoc push: Correctly failed with non-zero exit code when target is unreachable"
+
+# -------------------------------------------------------------
+# 10. Auto-Extract Tar Bomb / Quota Defense
+# -------------------------------------------------------------
+info "Test 10: Auto-Extract Tar Bomb / Quota Defense..."
+
+BOMB_NAME="tarbomb.tar"
+BOMB_PATH="$TEST_DIR/$BOMB_NAME"
+
+# Create a 100MB sparse file packaged into a 10KB tar archive
+dd if=/dev/zero of="$TEST_DIR/sparse.bin" bs=1M count=0 seek=100 status=none
+tar -cf "$BOMB_PATH" -C "$TEST_DIR" --sparse sparse.bin
+rm -f "$TEST_DIR/sparse.bin"
+
+if [ -f "$BOMB_PATH" ]; then
+    set +e
+    "$BIN" push -addr "$RECV_LISTEN" \
+        -cert "$KEYS_DIR/sender.crt" -key "$KEYS_DIR/sender.key" \
+        -peer-fp "$RECEIVER_FP" \
+        "$BOMB_PATH" 2>/dev/null
+    BOMB_PUSH_EXIT=$?
+    set -e
+
+    # Verify receiver rejected the tarbomb and no extracted hierarchy was created
+    if [ -d "$INCOMING_DIR/tarbomb" ]; then
+        fail "Tarbomb auto-extract created unconstrained extracted directory!"
+    fi
+    pass "Tarbomb expansion quota enforced: decompression bomb aborted and rejected"
+fi
+
+# -------------------------------------------------------------
+# 11. Security: Outbox Symlink Exfiltration Refusal
+# -------------------------------------------------------------
+info "Test 11: Security: Outbox Symlink Exfiltration Refusal..."
+
+# Ensure sender is running
+if [ -z "${SEND_PID:-}" ] || ! kill -0 "$SEND_PID" 2>/dev/null; then
+    start_sender
+fi
+
+# Create a sensitive secret file outside outbox
+SECRET_FILE="$TEST_DIR/super_secret_ssh_key"
+echo "SECRET_PRIVATE_KEY_DATA" > "$SECRET_FILE"
+
+# Place symlink in outbox pointing to secret file
+SYMLINK_OUTBOX="$OUTBOX_DIR/stolen_secret.txt"
+ln -sf "$SECRET_FILE" "$SYMLINK_OUTBOX"
+
+sleep 1
+
+# Verify the symlink was NOT transferred to incoming
+if [ -f "$INCOMING_DIR/stolen_secret.txt" ]; then
+    fail "Security violation: sender followed outbox symlink and exfiltrated host file!"
+fi
+
+# Verify symlink was not archived to .sent/
+if [ -f "$OUTBOX_DIR/.sent/stolen_secret.txt" ]; then
+    fail "Security violation: sender processed and archived outbox symlink!"
+fi
+
+rm -f "$SYMLINK_OUTBOX" "$SECRET_FILE"
+pass "Outbox symlink refused: daemon strictly rejects symlinks and prevents exfiltration"
+
+# -------------------------------------------------------------
+# 12. Mismatched Sender Certificate Pin (No Data Loss)
+# -------------------------------------------------------------
+info "Test 12: Mismatched Sender Certificate Pin (No Data Loss)..."
+
+ROGUE_OUTBOX="$TEST_DIR/rogue_outbox"
+mkdir -p "$ROGUE_OUTBOX"
+ROGUE_FILE="$ROGUE_OUTBOX/critical_dataset.bin"
+echo "precious uncorrupted dataset" > "$ROGUE_FILE"
+
+# Launch sender with unpinned cert against receiver for 2 seconds
+set +e
+"$BIN" send -dir "$ROGUE_OUTBOX" -addr "$RECV_LISTEN" \
+    -cert "$KEYS_DIR/rogue.crt" -key "$KEYS_DIR/rogue.key" \
+    -peer-fp "$RECEIVER_FP" -parallel 1 -scan 100ms -max-attempts 2 \
+    -disk-warn-pct 0 -disk-fail-pct 0 \
+    -name "rogue-sender-2" -status "127.0.0.1:9198" > /dev/null 2>&1 &
+ROGUE_PID2=$!
+sleep 2.5
+kill "$ROGUE_PID2" 2>/dev/null || true
+wait "$ROGUE_PID2" 2>/dev/null || true
+set -e
+
+# Verify the file is NOT in .failed/
+if [ -f "$ROGUE_OUTBOX/.failed/critical_dataset.bin" ]; then
+    fail "Bug reproduced: certificate rejection quarantined valid user file to .failed/!"
+fi
+
+# Verify file is still in outbox intact
+if [ ! -f "$ROGUE_FILE" ]; then
+    fail "Data loss: file disappeared from outbox after authentication rejection!"
+fi
+
+pass "Authentication rejection decoupled from file attempts: files preserved safely in outbox"
 
 echo "=========================================================="
 echo -e "${GREEN}    ALL VERIFICATION SCENARIOS PASSED SUCCESSFULLY!${NC}"

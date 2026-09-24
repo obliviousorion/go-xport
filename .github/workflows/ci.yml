@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+        cache: true
+
+    - name: Check code formatting (gofmt)
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "Unformatted files found:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Run go vet
+      run: go vet ./...
+
+    - name: Run unit tests with race detector
+      run: go test -race -v ./...
+
+    - name: Build binary
+      run: go build -v -o xport ./cmd/xport
+
+    - name: Run end-to-end integration test suite
+      run: ./test.sh
