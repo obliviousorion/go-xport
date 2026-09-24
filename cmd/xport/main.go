@@ -37,6 +37,8 @@ func main() {
 	switch subcommand {
 	case "keygen":
 		runKeygen(args)
+	case "push":
+		runPush(args)
 	case "send":
 		runSend(args)
 	case "recv":
@@ -54,10 +56,11 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `Usage: xport <subcommand> [flags]
+	fmt.Fprintf(os.Stderr, `Usage: xport <subcommand> [flags] [args]
 
 Subcommands:
   keygen   Generate ECDSA P-256 TLS keypair and print SHA-256 fingerprint
+  push     Ad-hoc push files or directories directly to a receiver
   send     Run sender daemon to watch directory and stream files to receiver
   recv     Run receiver daemon to listen for XP1 streams and commit files
   monitor  Run diagnostic monitor dashboard across multiple nodes
@@ -167,6 +170,7 @@ func runRecv(args []string) {
 	diskWarnPct := fs.Int("disk-warn-pct", 15, "Free space warning threshold")
 	diskFailPct := fs.Int("disk-fail-pct", 5, "Free space critical failure threshold")
 	collision := fs.String("collision", "rename", "Collision policy if destination file exists: rename, reject, overwrite")
+	autoExtract := fs.Bool("auto-extract", false, "Automatically extract received .tar archives into directories")
 	_ = fs.Parse(args)
 
 	if *cert == "" || *key == "" || *peerFP == "" {
@@ -204,11 +208,12 @@ func runRecv(args []string) {
 
 	recvServer := receiver.NewServer(*dir, *listen, *cert, *key, allowedFPs, maxSize, tracker)
 	recvServer.SetCollisionPolicy(*collision)
+	recvServer.SetAutoExtract(*autoExtract)
 	if err := recvServer.Start(); err != nil {
 		log.Fatalf("failed to start receiver ingress server: %v", err)
 	}
 	defer recvServer.Close()
-	log.Printf("[receiver] ingress server listening on %s (commit dir=%s, collision=%s)", *listen, *dir, *collision)
+	log.Printf("[receiver] ingress server listening on %s (commit dir=%s, collision=%s, auto-extract=%v)", *listen, *dir, *collision, *autoExtract)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -236,4 +241,40 @@ func runMonitor(args []string) {
 
 	exitCode := monitor.RunMonitor(*targets, *cert, *key, *watch, *timeout)
 	os.Exit(exitCode)
+}
+
+func runPush(args []string) {
+	fs := flag.NewFlagSet("push", flag.ExitOnError)
+	addr := fs.String("addr", "", "Receiver host:port (required)")
+	cert := fs.String("cert", "", "Path to client certificate (required)")
+	key := fs.String("key", "", "Path to client private key (required)")
+	peerFP := fs.String("peer-fp", "", "Comma-separated list of valid receiver cert SHA-256 fingerprints (required)")
+	timeout := fs.Duration("timeout", 10*time.Minute, "Total transfer timeout")
+	_ = fs.Parse(args)
+
+	paths := fs.Args()
+	if *addr == "" || *cert == "" || *key == "" || *peerFP == "" || len(paths) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: xport push -addr <host:port> -cert <cert> -key <key> -peer-fp <fp> <file1|dir1> [file2...]\n\n")
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	allowedFPs := tlsutil.ParseFingerprints([]string{*peerFP})
+	if len(allowedFPs) == 0 {
+		log.Fatalf("no valid peer fingerprints provided in -peer-fp")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	if err := sender.PushFiles(ctx, *addr, *cert, *key, allowedFPs, paths); err != nil {
+		log.Fatalf("[push] failed: %v", err)
+	}
 }

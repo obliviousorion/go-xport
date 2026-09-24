@@ -395,6 +395,111 @@ fi
 
 pass "All diagnostic endpoints (/status, /healthz, /metrics) verified"
 
+# -------------------------------------------------------------
+# 9. One-Shot Push, Universal Filenames & Directory Streaming
+# -------------------------------------------------------------
+info "Test 9: One-Shot Push, Spaces, Unicode & Directory Auto-Tarring..."
+
+# 9A: File with spaces, parentheses, and plus sign
+PUSH_FILE_SPACES="$TEST_DIR/push test (v1) + final.txt"
+echo "Payload with spaces and punctuation" > "$PUSH_FILE_SPACES"
+SPACES_ORIG_HASH=$(sha256sum "$PUSH_FILE_SPACES" | awk '{print $1}')
+
+"$BIN" push -addr "$RECV_LISTEN" \
+    -cert "$KEYS_DIR/sender.crt" -key "$KEYS_DIR/sender.key" \
+    -peer-fp "$RECEIVER_FP" \
+    "$PUSH_FILE_SPACES"
+
+RECV_SPACES="$INCOMING_DIR/push test (v1) + final.txt"
+if [ ! -f "$RECV_SPACES" ]; then
+    fail "File with spaces was not received"
+fi
+RECV_SPACES_HASH=$(sha256sum "$RECV_SPACES" | awk '{print $1}')
+if [ "$SPACES_ORIG_HASH" != "$RECV_SPACES_HASH" ]; then
+    fail "Hash mismatch for file with spaces"
+fi
+pass "Ad-hoc push: Filename with spaces and symbols transferred bit-for-bit"
+
+# 9B: File with UTF-8 Unicode
+PUSH_FILE_UNICODE="$TEST_DIR/日本語_résumé_モデル.bin"
+dd if=/dev/urandom of="$PUSH_FILE_UNICODE" bs=1024 count=64 status=none
+UNICODE_ORIG_HASH=$(sha256sum "$PUSH_FILE_UNICODE" | awk '{print $1}')
+
+"$BIN" push -addr "$RECV_LISTEN" \
+    -cert "$KEYS_DIR/sender.crt" -key "$KEYS_DIR/sender.key" \
+    -peer-fp "$RECEIVER_FP" \
+    "$PUSH_FILE_UNICODE"
+
+RECV_UNICODE="$INCOMING_DIR/日本語_résumé_モデル.bin"
+if [ ! -f "$RECV_UNICODE" ]; then
+    fail "Unicode file was not received"
+fi
+RECV_UNICODE_HASH=$(sha256sum "$RECV_UNICODE" | awk '{print $1}')
+if [ "$UNICODE_ORIG_HASH" != "$RECV_UNICODE_HASH" ]; then
+    fail "Hash mismatch for unicode file"
+fi
+pass "Ad-hoc push: UTF-8 Unicode filename transferred bit-for-bit"
+
+# 9C: Directory Auto-Tarring & Streaming with Receiver Auto-Extract
+kill "$RECV_PID" 2>/dev/null || true
+wait "$RECV_PID" 2>/dev/null || true
+
+# Start receiver with -auto-extract enabled
+"$BIN" recv -dir "$INCOMING_DIR" \
+    -listen "$RECV_LISTEN" \
+    -cert "$KEYS_DIR/receiver.crt" -key "$KEYS_DIR/receiver.key" \
+    -peer-fp "$SENDER_FP" -name "recv-A" \
+    -max-size "64GiB" \
+    -auto-extract \
+    -disk-warn-pct 0 -disk-fail-pct 0 \
+    -status "$RECV_STATUS" &
+RECV_PID=$!
+sleep 1
+
+# Create sample directory hierarchy
+MODEL_DIR="$TEST_DIR/my_checkpoint_dir"
+mkdir -p "$MODEL_DIR/weights" "$MODEL_DIR/config"
+echo '{"arch": "transformer", "layers": 12}' > "$MODEL_DIR/config/arch.json"
+dd if=/dev/urandom of="$MODEL_DIR/weights/layer1.bin" bs=1024 count=128 status=none
+ORIG_LAYER1_HASH=$(sha256sum "$MODEL_DIR/weights/layer1.bin" | awk '{print $1}')
+
+"$BIN" push -addr "$RECV_LISTEN" \
+    -cert "$KEYS_DIR/sender.crt" -key "$KEYS_DIR/sender.key" \
+    -peer-fp "$RECEIVER_FP" \
+    "$MODEL_DIR"
+
+# Verify .tar archive committed
+if [ ! -f "$INCOMING_DIR/my_checkpoint_dir.tar" ]; then
+    fail "my_checkpoint_dir.tar was not committed on receiver"
+fi
+
+# Verify auto-extract unpacked files cleanly
+EXTRACTED_ARCH="$INCOMING_DIR/my_checkpoint_dir/config/arch.json"
+EXTRACTED_LAYER="$INCOMING_DIR/my_checkpoint_dir/weights/layer1.bin"
+if [ ! -f "$EXTRACTED_ARCH" ] || [ ! -f "$EXTRACTED_LAYER" ]; then
+    fail "Directory auto-extract failed to unpack expected hierarchy"
+fi
+
+EXTRACTED_LAYER_HASH=$(sha256sum "$EXTRACTED_LAYER" | awk '{print $1}')
+if [ "$ORIG_LAYER1_HASH" != "$EXTRACTED_LAYER_HASH" ]; then
+    fail "Auto-extracted file hash mismatch"
+fi
+pass "Ad-hoc push: Directory streamed on-the-fly and auto-extracted by receiver"
+
+# 9D: Push rejection when target is unreachable
+set +e
+"$BIN" push -addr "127.0.0.1:9999" \
+    -cert "$KEYS_DIR/sender.crt" -key "$KEYS_DIR/sender.key" \
+    -peer-fp "$RECEIVER_FP" \
+    -timeout 2s \
+    "$PUSH_FILE_SPACES" 2>/dev/null
+PUSH_DOWN_EXIT=$?
+set -e
+if [ "$PUSH_DOWN_EXIT" -eq 0 ]; then
+    fail "Expected xport push to fail against unreachable receiver"
+fi
+pass "Ad-hoc push: Correctly failed with non-zero exit code when target is unreachable"
+
 echo "=========================================================="
 echo -e "${GREEN}    ALL VERIFICATION SCENARIOS PASSED SUCCESSFULLY!${NC}"
 echo "=========================================================="

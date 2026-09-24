@@ -16,6 +16,13 @@ func TestValidateFilename(t *testing.T) {
 		"A",
 		"shard_001.tar",
 		"dataset-part-001.parquet",
+		"file with spaces.txt",
+		"model+v2(beta).bin",
+		"data[test]=1,2.csv",
+		"déjà_vu_metrics.json",
+		"日本語_dataset.tar",
+		"-leading-dash.tar",
+		"_leading_underscore.pt",
 	}
 	for _, f := range valid {
 		if err := ValidateFilename(f); err != nil {
@@ -31,8 +38,11 @@ func TestValidateFilename(t *testing.T) {
 		"shard.tmp",
 		"shard.part",
 		".hidden",
-		"-leading-dash",
-		"_leading_underscore",
+		".",
+		"..",
+		"file\x00bad",
+		"file\nbad",
+		"file\rbad",
 		strings.Repeat("a", 201),
 	}
 	for _, f := range invalid {

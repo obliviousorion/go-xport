@@ -137,12 +137,39 @@ The output hash on Machine B will match the expected hash displayed on Machine A
 
 ---
 
+## Ad-Hoc One-Shot Push (`xport push`)
+
+Instead of running continuous sender daemons, you can transfer files or entire directories directly and exit immediately:
+
+```bash
+# Push files directly (supports spaces, punctuation, and Unicode UTF-8)
+./xport push \
+  -addr "<RECEIVER_IP>:9000" \
+  -cert keys/sender.crt \
+  -key keys/sender.key \
+  -peer-fp "<RECEIVER_FP>" \
+  "model weights.pt" "dataset (v1).csv" "日本語_dataset.tar"
+
+# Push an entire directory (streamed on-the-fly via auto-tar without buffering to disk)
+./xport push \
+  -addr "<RECEIVER_IP>:9000" \
+  -cert keys/sender.crt \
+  -key keys/sender.key \
+  -peer-fp "<RECEIVER_FP>" \
+  ./checkpoint_dir/
+```
+
+*Receiver Auto-Extract*: Pass `-auto-extract` to `./xport recv` to automatically unpack incoming `.tar` archives into isolated directories with Zip-Slip path traversal protection.
+
+---
+
 ## CLI Summary
 
 | Command | Primary Flags | Description |
 |---|---|---|
 | `keygen` | `-name <prefix>`, `-days <int>` | Generate ECDSA P-256 keypair and print SHA-256 fingerprint |
-| `recv` | `-dir <path>`, `-listen <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-collision <rename\|reject\|overwrite>` | Run receiver daemon with mTLS and atomic commit |
+| `push` | `-addr <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-timeout <duration>` | Ad-hoc push files or directories directly to receiver |
+| `recv` | `-dir <path>`, `-listen <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-auto-extract`, `-collision <rename\|reject\|overwrite>` | Run receiver daemon with mTLS and atomic commit |
 | `send` | `-dir <path>`, `-addr <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-after <archive\|delete>` | Watch directory and stream files to receiver |
 | `monitor` | `-targets <addr@fp,...>`, `-cert <path>`, `-key <path>`, `-watch <interval>` | Poll node diagnostics and render terminal dashboard |
 

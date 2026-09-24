@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -82,17 +83,17 @@ func (p *ClientPool) Stop() {
 	})
 }
 
-// dialPersistent creates a new TLS 1.3 connection to the receiver enforcing a 10s handshake deadline.
-func (p *ClientPool) dialPersistent() (net.Conn, error) {
-	tlsCfg, err := tlsutil.NewClientTLSConfig(p.certFile, p.keyFile, p.allowedReceiverFP)
+// DialTarget creates a mutual TLS 1.3 connection to the receiver enforcing a 10s handshake deadline.
+func DialTarget(targetAddr, certFile, keyFile string, allowedReceiverFPs []string) (net.Conn, error) {
+	tlsCfg, err := tlsutil.NewClientTLSConfig(certFile, keyFile, allowedReceiverFPs)
 	if err != nil {
 		return nil, fmt.Errorf("client tls config error: %w", err)
 	}
 
 	dialer := &net.Dialer{Timeout: wire.HandshakeTimeout}
-	rawConn, err := dialer.Dial("tcp", p.targetAddr)
+	rawConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		return nil, fmt.Errorf("dial failed to %s: %w", p.targetAddr, err)
+		return nil, fmt.Errorf("dial failed to %s: %w", targetAddr, err)
 	}
 
 	tlsConn := tls.Client(rawConn, tlsCfg)
@@ -103,6 +104,128 @@ func (p *ClientPool) dialPersistent() (net.Conn, error) {
 	}
 
 	return tlsConn, nil
+}
+
+// dialPersistent creates a new TLS 1.3 connection to the receiver enforcing a 10s handshake deadline.
+func (p *ClientPool) dialPersistent() (net.Conn, error) {
+	return DialTarget(p.targetAddr, p.certFile, p.keyFile, p.allowedReceiverFP)
+}
+
+// PushFiles sends one or more files or directories directly to a target receiver over a persistent TLS 1.3 connection.
+// If a path is a directory, it is automatically packaged and streamed on-the-fly as a tar archive without intermediate disk writes.
+func PushFiles(ctx context.Context, targetAddr, certFile, keyFile string, allowedReceiverFPs []string, paths []string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("no paths specified to push")
+	}
+
+	type pushTarget struct {
+		originalPath string
+		wireName     string
+		isDir        bool
+		size         uint64
+	}
+
+	var targets []pushTarget
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("cannot access %s: %w", p, err)
+		}
+
+		base := filepath.Base(p)
+		if info.IsDir() {
+			wireName := base + ".tar"
+			if err := wire.ValidateFilename(wireName); err != nil {
+				return fmt.Errorf("invalid wire name %q for directory %s: %w", wireName, p, err)
+			}
+			size, err := CalculateTarSize(p)
+			if err != nil {
+				return fmt.Errorf("failed to calculate tar size for %s: %w", p, err)
+			}
+			targets = append(targets, pushTarget{
+				originalPath: p,
+				wireName:     wireName,
+				isDir:        true,
+				size:         size,
+			})
+		} else {
+			if err := wire.ValidateFilename(base); err != nil {
+				return fmt.Errorf("invalid filename %q: %w", base, err)
+			}
+			targets = append(targets, pushTarget{
+				originalPath: p,
+				wireName:     base,
+				isDir:        false,
+				size:         uint64(info.Size()),
+			})
+		}
+	}
+
+	conn, err := DialTarget(targetAddr, certFile, keyFile, allowedReceiverFPs)
+	if err != nil {
+		return fmt.Errorf("connect error: %w", err)
+	}
+	defer conn.Close()
+
+	log.Printf("[push] connected to %s (mTLS 1.3 pinned)", targetAddr)
+
+	for i, t := range targets {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		kindStr := "file"
+		if t.isDir {
+			kindStr = "directory (auto-tar)"
+		}
+		log.Printf("[push] [%d/%d] streaming %s %q (%s)...", i+1, len(targets), kindStr, t.wireName, monitor.FormatBytes(t.size))
+
+		var r io.ReadCloser
+		if t.isDir {
+			var err error
+			r, err = StreamTar(t.originalPath)
+			if err != nil {
+				return fmt.Errorf("failed to stream directory %s: %w", t.originalPath, err)
+			}
+		} else {
+			f, err := os.Open(t.originalPath)
+			if err != nil {
+				return fmt.Errorf("failed to open file %s: %w", t.originalPath, err)
+			}
+			r = f
+		}
+
+		start := time.Now()
+		deadlineConn := wire.NewDeadlineConn(conn, wire.ReadWriteTimeout)
+
+		if err := wire.WriteRequestHeader(deadlineConn, t.wireName, t.size); err != nil {
+			_ = r.Close()
+			return fmt.Errorf("header send failed for %s: %w", t.wireName, err)
+		}
+
+		sum, err := wire.SendStream(deadlineConn, r, t.size)
+		_ = r.Close()
+		if err != nil {
+			return fmt.Errorf("stream failed for %s: %w", t.wireName, err)
+		}
+
+		if err := wire.ReadResponse(deadlineConn); err != nil {
+			return fmt.Errorf("receiver rejected %s: %w", t.wireName, err)
+		}
+
+		elapsed := time.Since(start)
+		speedMBs := 0.0
+		if elapsed.Seconds() > 0 {
+			speedMBs = (float64(t.size) / (1024 * 1024)) / elapsed.Seconds()
+		}
+
+		log.Printf("[push] ACK received: %s (SHA-256: %x in %v, %.1f MB/s)", t.wireName, sum[:8], elapsed.Round(time.Millisecond), speedMBs)
+	}
+
+	log.Printf("[push] all %d item(s) transferred successfully", len(targets))
+	return nil
 }
 
 // workerLoop processes files sequentially, keeping the TLS connection persistent across files.

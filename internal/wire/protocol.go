@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Magic bytes for XP1 protocol: "XP1\n"
@@ -35,7 +36,7 @@ var (
 	filenameRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$`)
 
 	ErrInvalidMagic       = errors.New("invalid protocol magic header")
-	ErrInvalidFilename    = errors.New("invalid filename: must match regex ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ and not end in .tmp or .part")
+	ErrInvalidFilename    = errors.New("invalid filename: must be a valid UTF-8 basename not ending in .tmp or .part, without path separators or control characters")
 	ErrPayloadTooLarge    = errors.New("payload size exceeds maximum allowed size")
 	ErrChecksumMismatch   = errors.New("sha-256 checksum mismatch")
 	ErrUnexpectedResponse = errors.New("unexpected response code from receiver")
@@ -44,17 +45,30 @@ var (
 
 // ValidateFilename validates the filename according to the XP1 specification:
 // - Basename only (reject path separators / or \)
-// - Matches regex ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$
+// - Length between 1 and MaxFilenameLen bytes
+// - Must not start with '.' (hidden files / atomic staging)
 // - Must not end in .tmp or .part
+// - Valid UTF-8 string with no unprintable control characters
 func ValidateFilename(name string) error {
-	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
-		return fmt.Errorf("%w: path separators not allowed", ErrInvalidFilename)
+	if len(name) == 0 || len(name) > MaxFilenameLen {
+		return fmt.Errorf("%w: length %d must be between 1 and %d bytes", ErrInvalidFilename, len(name), MaxFilenameLen)
+	}
+	if strings.ContainsAny(name, "/\\\x00\r\n\t") {
+		return fmt.Errorf("%w: path separators and control characters not allowed", ErrInvalidFilename)
+	}
+	if name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		return fmt.Errorf("%w: hidden or directory reference names not allowed", ErrInvalidFilename)
 	}
 	if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".part") {
 		return fmt.Errorf("%w: cannot end with .tmp or .part", ErrInvalidFilename)
 	}
-	if !filenameRegex.MatchString(name) {
-		return ErrInvalidFilename
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("%w: filename is not valid UTF-8", ErrInvalidFilename)
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: unprintable control character in filename", ErrInvalidFilename)
+		}
 	}
 	return nil
 }

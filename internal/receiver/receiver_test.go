@@ -1,6 +1,7 @@
 package receiver
 
 import (
+	"archive/tar"
 	"bytes"
 	"crypto/tls"
 	"net"
@@ -58,7 +59,8 @@ func TestCommitBarrier(t *testing.T) {
 	filename := "checkpoint-001.bin"
 	var replyBuf bytes.Buffer
 
-	if err := CommitBarrier(stagedFile, stagedPath, tempDir, filename, "rename", &replyBuf); err != nil {
+	committedPath, err := CommitBarrier(stagedFile, stagedPath, tempDir, filename, "rename", false, &replyBuf)
+	if err != nil {
 		t.Fatalf("CommitBarrier failed: %v", err)
 	}
 
@@ -69,6 +71,9 @@ func TestCommitBarrier(t *testing.T) {
 
 	// Verify file is placed in incoming root
 	targetPath := filepath.Join(tempDir, filename)
+	if committedPath != targetPath {
+		t.Fatalf("expected committed path %s, got %s", targetPath, committedPath)
+	}
 	data, err := os.ReadFile(targetPath)
 	if err != nil {
 		t.Fatalf("committed file does not exist: %v", err)
@@ -93,7 +98,7 @@ func TestCommitBarrierCollision(t *testing.T) {
 	stagedFile1, stagedPath1, _ := CreateStagedFile(tempDir)
 	_, _ = stagedFile1.Write([]byte("duplicate"))
 	var replyBuf1 bytes.Buffer
-	err := CommitBarrier(stagedFile1, stagedPath1, tempDir, filename, "reject", &replyBuf1)
+	_, err := CommitBarrier(stagedFile1, stagedPath1, tempDir, filename, "reject", false, &replyBuf1)
 	if err == nil {
 		t.Fatalf("expected error on collision with reject policy")
 	}
@@ -102,7 +107,7 @@ func TestCommitBarrierCollision(t *testing.T) {
 	stagedFile2, stagedPath2, _ := CreateStagedFile(tempDir)
 	_, _ = stagedFile2.Write([]byte("renamed-version"))
 	var replyBuf2 bytes.Buffer
-	err = CommitBarrier(stagedFile2, stagedPath2, tempDir, filename, "rename", &replyBuf2)
+	_, err = CommitBarrier(stagedFile2, stagedPath2, tempDir, filename, "rename", false, &replyBuf2)
 	if err != nil {
 		t.Fatalf("unexpected error on collision with rename policy: %v", err)
 	}
@@ -116,7 +121,7 @@ func TestCommitBarrierCollision(t *testing.T) {
 	stagedFile3, stagedPath3, _ := CreateStagedFile(tempDir)
 	_, _ = stagedFile3.Write([]byte("overwritten"))
 	var replyBuf3 bytes.Buffer
-	err = CommitBarrier(stagedFile3, stagedPath3, tempDir, filename, "overwrite", &replyBuf3)
+	_, err = CommitBarrier(stagedFile3, stagedPath3, tempDir, filename, "overwrite", false, &replyBuf3)
 	if err != nil {
 		t.Fatalf("unexpected error on collision with overwrite policy: %v", err)
 	}
@@ -212,5 +217,168 @@ func TestReceiverServerTransfer(t *testing.T) {
 	}
 	if !bytes.Equal(data2, payload2) {
 		t.Fatalf("committed payload 2 mismatch")
+	}
+}
+
+func TestExtractTar(t *testing.T) {
+	tempDir := t.TempDir()
+	tarFile := filepath.Join(tempDir, "archive.tar")
+	destDir := filepath.Join(tempDir, "extracted")
+
+	// Create test tar archive with normal and malicious path traversal entries
+	f, err := os.Create(tarFile)
+	if err != nil {
+		t.Fatalf("failed to create tar file: %v", err)
+	}
+	tw := tar.NewWriter(f)
+
+	// Valid dir
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "subdir/",
+		Mode:     0755,
+		Typeflag: tar.TypeDir,
+	}); err != nil {
+		t.Fatalf("write dir header: %v", err)
+	}
+
+	// Valid file inside dir
+	content1 := []byte("nested file content")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "subdir/hello.txt",
+		Mode:     0644,
+		Size:     int64(len(content1)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("write file header: %v", err)
+	}
+	if _, err := tw.Write(content1); err != nil {
+		t.Fatalf("write file content: %v", err)
+	}
+
+	// Malicious relative path traversal entry
+	evilContent := []byte("evil traversal payload")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "../escaped.txt",
+		Mode:     0644,
+		Size:     int64(len(evilContent)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("write evil header: %v", err)
+	}
+	if _, err := tw.Write(evilContent); err != nil {
+		t.Fatalf("write evil content: %v", err)
+	}
+
+	// Malicious absolute path entry
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "/tmp/abs_escaped.txt",
+		Mode:     0644,
+		Size:     int64(len(evilContent)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("write abs evil header: %v", err)
+	}
+	if _, err := tw.Write(evilContent); err != nil {
+		t.Fatalf("write abs evil content: %v", err)
+	}
+
+	_ = tw.Close()
+	_ = f.Close()
+
+	if err := ExtractTar(tarFile, destDir); err != nil {
+		t.Fatalf("ExtractTar failed: %v", err)
+	}
+
+	// Verify valid file extracted
+	extractedFile := filepath.Join(destDir, "subdir", "hello.txt")
+	got, err := os.ReadFile(extractedFile)
+	if err != nil {
+		t.Fatalf("expected extracted file %s, err: %v", extractedFile, err)
+	}
+	if !bytes.Equal(got, content1) {
+		t.Fatalf("content mismatch, got %s", string(got))
+	}
+
+	// Verify traversal entry was ignored and escaped.txt does not exist
+	escapedPath := filepath.Join(tempDir, "escaped.txt")
+	if _, err := os.Stat(escapedPath); !os.IsNotExist(err) {
+		t.Fatalf("security violation: path traversal wrote to %s", escapedPath)
+	}
+}
+
+func TestReceiverAutoExtract(t *testing.T) {
+	tempDir := t.TempDir()
+	keysDir := filepath.Join(tempDir, "keys")
+	_ = os.MkdirAll(keysDir, 0755)
+
+	recvCert := filepath.Join(keysDir, "recv.crt")
+	recvKey := filepath.Join(keysDir, "recv.key")
+	recvFP, _ := tlsutil.GenerateCert("recv", 1, recvCert, recvKey)
+
+	sendCert := filepath.Join(keysDir, "send.crt")
+	sendKey := filepath.Join(keysDir, "send.key")
+	sendFP, _ := tlsutil.GenerateCert("send", 1, sendCert, sendKey)
+
+	incomingDir := filepath.Join(tempDir, "incoming")
+	srv := NewServer(incomingDir, "127.0.0.1:0", recvCert, recvKey, []string{sendFP}, 1024*1024, nil)
+	srv.SetAutoExtract(true)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Close()
+
+	clientTLS, err := tlsutil.NewClientTLSConfig(sendCert, sendKey, []string{recvFP})
+	if err != nil {
+		t.Fatalf("client TLS config failed: %v", err)
+	}
+
+	conn, err := tls.Dial("tcp", srv.Addr().String(), clientTLS)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Build a valid in-memory .tar
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	fileData := []byte("model parameters json")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "model_dir/params.json",
+		Mode:     0644,
+		Size:     int64(len(fileData)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("tar write header: %v", err)
+	}
+	if _, err := tw.Write(fileData); err != nil {
+		t.Fatalf("tar write body: %v", err)
+	}
+	_ = tw.Close()
+
+	tarBytes := tarBuf.Bytes()
+	filename := "bundle.tar"
+	if err := wire.WriteRequestHeader(conn, filename, uint64(len(tarBytes))); err != nil {
+		t.Fatalf("WriteRequestHeader failed: %v", err)
+	}
+	if _, err := wire.SendStream(conn, bytes.NewReader(tarBytes), uint64(len(tarBytes))); err != nil {
+		t.Fatalf("SendStream failed: %v", err)
+	}
+	if err := wire.ReadResponse(conn); err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+
+	// Verify bundle.tar exists
+	if _, err := os.Stat(filepath.Join(incomingDir, "bundle.tar")); err != nil {
+		t.Fatalf("bundle.tar missing: %v", err)
+	}
+
+	// Verify auto-extracted model_dir/params.json exists
+	extractedFile := filepath.Join(incomingDir, "bundle", "model_dir", "params.json")
+	got, err := os.ReadFile(extractedFile)
+	if err != nil {
+		t.Fatalf("auto-extracted file missing at %s: %v", extractedFile, err)
+	}
+	if !bytes.Equal(got, fileData) {
+		t.Fatalf("auto-extracted content mismatch: got %s, want %s", string(got), string(fileData))
 	}
 }

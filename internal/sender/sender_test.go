@@ -3,6 +3,7 @@ package sender
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -131,7 +132,7 @@ func TestScannerWarnsOnInvalidFilename(t *testing.T) {
 	queue := NewQueue(tempDir, 10, nil)
 	scanner := NewScanner(tempDir, 50*time.Millisecond, queue)
 
-	invalidFile := filepath.Join(tempDir, "bad name with spaces.tar")
+	invalidFile := filepath.Join(tempDir, "bad\nname.tar")
 	_ = os.WriteFile(invalidFile, []byte("data"), 0644)
 
 	scanner.scanOnce()
@@ -142,7 +143,7 @@ func TestScannerWarnsOnInvalidFilename(t *testing.T) {
 
 	// Should be tracked in ignoredWarned
 	scanner.mu.Lock()
-	_, warned := scanner.ignoredWarned["bad name with spaces.tar"]
+	_, warned := scanner.ignoredWarned["bad\nname.tar"]
 	scanner.mu.Unlock()
 	if !warned {
 		t.Fatalf("expected invalid file to be recorded in ignoredWarned")
@@ -153,7 +154,7 @@ func TestScannerWarnsOnInvalidFilename(t *testing.T) {
 	scanner.scanOnce()
 
 	scanner.mu.Lock()
-	_, warned = scanner.ignoredWarned["bad name with spaces.tar"]
+	_, warned = scanner.ignoredWarned["bad\nname.tar"]
 	scanner.mu.Unlock()
 	if warned {
 		t.Fatalf("expected ignoredWarned entry to be cleaned up after file removal")
@@ -238,5 +239,106 @@ func TestSenderReceiverEndToEnd(t *testing.T) {
 
 	if _, err := os.Stat(sentPath); err != nil {
 		t.Fatalf("file not archived to .sent/: %v", err)
+	}
+}
+
+func TestCalculateTarSizeAndStreamTar(t *testing.T) {
+	tempDir := t.TempDir()
+	sourceDir := filepath.Join(tempDir, "test_folder")
+	_ = os.MkdirAll(filepath.Join(sourceDir, "sub"), 0755)
+	_ = os.WriteFile(filepath.Join(sourceDir, "file1.txt"), []byte("hello world"), 0644)
+	_ = os.WriteFile(filepath.Join(sourceDir, "sub", "file2.txt"), []byte("nested file content"), 0644)
+
+	expectedSize, err := CalculateTarSize(sourceDir)
+	if err != nil {
+		t.Fatalf("CalculateTarSize failed: %v", err)
+	}
+	if expectedSize == 0 {
+		t.Fatalf("expected non-zero tar size")
+	}
+
+	stream, err := StreamTar(sourceDir)
+	if err != nil {
+		t.Fatalf("StreamTar failed: %v", err)
+	}
+	defer stream.Close()
+
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("reading from StreamTar failed: %v", err)
+	}
+
+	if uint64(len(data)) != expectedSize {
+		t.Fatalf("streamed bytes %d != calculated size %d", len(data), expectedSize)
+	}
+}
+
+func TestPushFilesSpacesUnicodeAndDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	incomingDir := filepath.Join(tempDir, "incoming")
+	keysDir := filepath.Join(tempDir, "keys")
+	_ = os.MkdirAll(incomingDir, 0755)
+	_ = os.MkdirAll(keysDir, 0755)
+
+	recvCert := filepath.Join(keysDir, "recv.crt")
+	recvKey := filepath.Join(keysDir, "recv.key")
+	recvFP, err := tlsutil.GenerateCert("receiver", 365, recvCert, recvKey)
+	if err != nil {
+		t.Fatalf("receiver cert failed: %v", err)
+	}
+
+	sendCert := filepath.Join(keysDir, "send.crt")
+	sendKey := filepath.Join(keysDir, "send.key")
+	sendFP, err := tlsutil.GenerateCert("sender", 365, sendCert, sendKey)
+	if err != nil {
+		t.Fatalf("sender cert failed: %v", err)
+	}
+
+	// Start Receiver
+	recvServer := receiver.NewServer(incomingDir, "127.0.0.1:0", recvCert, recvKey, []string{sendFP}, 1024*1024*10, nil)
+	if err := recvServer.Start(); err != nil {
+		t.Fatalf("recvServer.Start failed: %v", err)
+	}
+	defer recvServer.Close()
+
+	receiverAddr := recvServer.Addr().String()
+
+	// 1. Create a file with spaces, symbols, and unicode
+	specialFile := filepath.Join(tempDir, "my dataset file (1) + résumé.txt")
+	specialContent := []byte("universal unicode content: 日本語")
+	_ = os.WriteFile(specialFile, specialContent, 0644)
+
+	// 2. Create a directory to auto-tar
+	specialDir := filepath.Join(tempDir, "deep_model_dir")
+	_ = os.MkdirAll(filepath.Join(specialDir, "weights"), 0755)
+	_ = os.WriteFile(filepath.Join(specialDir, "weights", "layer1.bin"), []byte("tensor weights 123"), 0644)
+
+	// Execute PushFiles
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = PushFiles(ctx, receiverAddr, sendCert, sendKey, []string{recvFP}, []string{specialFile, specialDir})
+	if err != nil {
+		t.Fatalf("PushFiles failed: %v", err)
+	}
+
+	// Verify special file received
+	recvSpecialPath := filepath.Join(incomingDir, "my dataset file (1) + résumé.txt")
+	recvData, err := os.ReadFile(recvSpecialPath)
+	if err != nil {
+		t.Fatalf("special file was not received: %v", err)
+	}
+	if string(recvData) != string(specialContent) {
+		t.Fatalf("content mismatch on special file")
+	}
+
+	// Verify directory received as .tar
+	recvTarPath := filepath.Join(incomingDir, "deep_model_dir.tar")
+	tarInfo, err := os.Stat(recvTarPath)
+	if err != nil {
+		t.Fatalf("tar archive was not received: %v", err)
+	}
+	if tarInfo.Size() == 0 {
+		t.Fatalf("received tar archive is empty")
 	}
 }
