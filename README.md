@@ -1,4 +1,4 @@
-# `xport` — Distributed ML Pipeline Transport Daemon & Health Monitor
+# `xport` — Distributed Systems Transport Daemon & Health Monitor
 
 `xport` is an independent, high-performance, point-to-point data transport daemon and health monitor built for distributed ML training and data ingestion pipelines. Written in **pure Go 1.22+ using only the standard library (zero external dependencies)**, `xport` guarantees bit-for-bit data integrity, atomic durability barriers, and mutual TLS 1.3 certificate fingerprint pinning.
 
