@@ -116,6 +116,9 @@ func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 		}
 	}()
 
+	dialBackoff := 1 * time.Second
+	const maxDialBackoff = 30 * time.Second
+
 	for {
 		select {
 		case <-p.stopCh:
@@ -136,18 +139,23 @@ func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 			var err error
 			conn, err = p.dialPersistent()
 			if err != nil {
-				log.Printf("[sender-%d] connect error to %s: %v", workerID, p.targetAddr, err)
+				log.Printf("[sender-%d] connect error to %s: %v (retrying in %v)", workerID, p.targetAddr, err, dialBackoff)
 				if p.tracker != nil {
 					p.tracker.RecordError()
 				}
-				p.queue.RecordFailure(item, err)
+				p.queue.Requeue(item)
 				select {
 				case <-p.stopCh:
 					return
-				case <-time.After(1 * time.Second): // Backoff on connection failure
+				case <-time.After(dialBackoff):
+				}
+				dialBackoff *= 2
+				if dialBackoff > maxDialBackoff {
+					dialBackoff = maxDialBackoff
 				}
 				continue
 			}
+			dialBackoff = 1 * time.Second
 		}
 
 		// Transfer file
@@ -164,20 +172,29 @@ func (p *ClientPool) workerLoop(ctx context.Context, workerID int) {
 			if quarantined && p.scanner != nil {
 				p.scanner.MarkCompleted(item.Filename)
 			}
+			// Backoff on transfer failure to prevent tight CPU spin
+			select {
+			case <-p.stopCh:
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 			continue
 		}
 
 		// Transfer succeeded: post-commit action
-		if err := p.postCommit(item); err != nil {
-			log.Printf("[sender-%d] post-commit error for %s: %v", workerID, item.Filename, err)
-		}
-
-		p.queue.RecordSuccess(item.Filename)
-		if p.scanner != nil {
-			p.scanner.MarkCompleted(item.Filename)
-		}
-		if p.tracker != nil {
-			p.tracker.RecordSuccess(uint64(item.Size))
+		if postCommitErr := p.postCommit(item); postCommitErr != nil {
+			log.Printf("[sender-%d] CRITICAL: post-commit error for %s: %v; preserving file tracking to avoid infinite retransmission", workerID, item.Filename, postCommitErr)
+			if p.tracker != nil {
+				p.tracker.RecordError()
+			}
+		} else {
+			p.queue.RecordSuccess(item.Filename)
+			if p.scanner != nil {
+				p.scanner.MarkCompleted(item.Filename)
+			}
+			if p.tracker != nil {
+				p.tracker.RecordSuccess(uint64(item.Size))
+			}
 		}
 	}
 }
@@ -228,6 +245,10 @@ func (p *ClientPool) postCommit(item FileItem) error {
 			return fmt.Errorf("failed to create .sent dir: %w", err)
 		}
 		destPath := filepath.Join(sentDir, item.Filename)
+		if _, err := os.Stat(destPath); err == nil {
+			// Avoid collision by appending timestamp
+			destPath = filepath.Join(sentDir, fmt.Sprintf("%s.%d", item.Filename, time.Now().UnixNano()))
+		}
 		return os.Rename(item.Path, destPath)
 	}
 }

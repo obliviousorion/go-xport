@@ -95,6 +95,71 @@ func TestQuarantineAfterMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestRequeueDoesNotIncrementAttempts(t *testing.T) {
+	tempDir := t.TempDir()
+	queue := NewQueue(tempDir, 3, nil)
+
+	item := FileItem{
+		Filename: "healthy.bin",
+		Path:     filepath.Join(tempDir, "healthy.bin"),
+		Size:     100,
+		ModTime:  time.Now(),
+	}
+	queue.Push(item)
+
+	// Simulate 10 network dial disconnects
+	for i := 0; i < 10; i++ {
+		it, ok := queue.Pop()
+		if !ok {
+			t.Fatal("failed to pop")
+		}
+		// Requeue without incrementing attempts
+		queue.Requeue(it)
+	}
+
+	// Verify item is still in queue, not quarantined
+	if queue.Len() != 1 {
+		t.Fatalf("expected 1 item in queue, got %d", queue.Len())
+	}
+	if queue.failedCount != 0 {
+		t.Fatalf("expected 0 failed files, got %d", queue.failedCount)
+	}
+}
+
+func TestScannerWarnsOnInvalidFilename(t *testing.T) {
+	tempDir := t.TempDir()
+	queue := NewQueue(tempDir, 10, nil)
+	scanner := NewScanner(tempDir, 50*time.Millisecond, queue)
+
+	invalidFile := filepath.Join(tempDir, "bad name with spaces.tar")
+	_ = os.WriteFile(invalidFile, []byte("data"), 0644)
+
+	scanner.scanOnce()
+	// Should not be in queue
+	if queue.Len() != 0 {
+		t.Fatalf("invalid file should not be in queue")
+	}
+
+	// Should be tracked in ignoredWarned
+	scanner.mu.Lock()
+	_, warned := scanner.ignoredWarned["bad name with spaces.tar"]
+	scanner.mu.Unlock()
+	if !warned {
+		t.Fatalf("expected invalid file to be recorded in ignoredWarned")
+	}
+
+	// Delete file and scan again
+	_ = os.Remove(invalidFile)
+	scanner.scanOnce()
+
+	scanner.mu.Lock()
+	_, warned = scanner.ignoredWarned["bad name with spaces.tar"]
+	scanner.mu.Unlock()
+	if warned {
+		t.Fatalf("expected ignoredWarned entry to be cleaned up after file removal")
+	}
+}
+
 func TestSenderReceiverEndToEnd(t *testing.T) {
 	tempDir := t.TempDir()
 	outboxDir := filepath.Join(tempDir, "outbox")

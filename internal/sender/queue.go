@@ -89,6 +89,29 @@ func (q *Queue) Push(item FileItem) {
 	q.cond.Signal()
 }
 
+// Requeue puts an item back to the queue (e.g. after a transport/dial error)
+// without incrementing its failure attempts count.
+func (q *Queue) Requeue(item FileItem) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.stopped {
+		return
+	}
+
+	if _, exists := q.inQueue[item.Filename]; !exists {
+		q.items = append([]FileItem{item}, q.items...)
+		q.inQueue[item.Filename] = struct{}{}
+		sort.Slice(q.items, func(i, j int) bool {
+			return q.items[i].ModTime.Before(q.items[j].ModTime)
+		})
+		if q.tracker != nil {
+			q.tracker.SetQueueCounts(len(q.items), q.failedCount)
+		}
+		q.cond.Signal()
+	}
+}
+
 // Pop retrieves the next file in FIFO order. Blocks if queue is empty until an item is pushed or queue stopped.
 // Returns item, ok (false if stopped).
 func (q *Queue) Pop() (FileItem, bool) {
