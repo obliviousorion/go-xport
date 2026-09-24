@@ -16,13 +16,9 @@ go build -o xport ./cmd/xport
 
 ### Phase 0: Clean Slate (Run on Both PCs)
 
-Wipe any stale certificates, test directories, or lingering processes to avoid fingerprint mismatches.
-
 ```bash
-# Kill any running xport instances
+# Kill any running xport instances and remove old directories
 pkill -f xport || true
-
-# Remove old keys and transfer directories
 rm -rf keys incoming outbox
 ```
 
@@ -30,37 +26,30 @@ rm -rf keys incoming outbox
 
 ### Phase 1: Machine B (Receiver) Setup & Keygen
 
-Run all commands on **Machine B**.
+Run on **Machine B**:
 
 ```bash
-# 1. Get Machine B's IP address (Save this as RECEIVER_IP)
+# 1. Get Machine B's IP address (Save as RECEIVER_IP)
 hostname -I | awk '{print $1}'
+# (If on AWS/cloud across the internet: curl -s checkip.amazonaws.com)
 
-# 2. Create directories
+# 2. Create directories & generate Receiver keypair
 mkdir -p incoming keys
-
-# 3. Generate Receiver keypair
 ./xport keygen -name keys/receiver
-
-# 4. Print Receiver Fingerprint (Save this 64-character hash as RECEIVER_FP)
-openssl x509 -in keys/receiver.crt -outform DER | sha256sum | awk '{print $1}'
+# -> Copy the printed 64-character hash as RECEIVER_FP
 ```
 
 ---
 
 ### Phase 2: Machine A (Sender) Setup & Keygen
 
-Run all commands on **Machine A**.
+Run on **Machine A**:
 
 ```bash
-# 1. Create directories
+# Create directories & generate Sender keypair
 mkdir -p outbox keys
-
-# 2. Generate Sender keypair
 ./xport keygen -name keys/sender
-
-# 3. Print Sender Fingerprint (Save this 64-character hash as SENDER_FP)
-openssl x509 -in keys/sender.crt -outform DER | sha256sum | awk '{print $1}'
+# -> Copy the printed 64-character hash as SENDER_FP
 ```
 
 ---
@@ -69,7 +58,7 @@ openssl x509 -in keys/sender.crt -outform DER | sha256sum | awk '{print $1}'
 
 #### 1. On Machine B (Receiver)
 
-Replace `<SENDER_FP>` with the 64-character hash printed from **Machine A**:
+Replace `<SENDER_FP>` with the hash printed from **Machine A**:
 
 ```bash
 ./xport recv \
@@ -83,7 +72,6 @@ Replace `<SENDER_FP>` with the 64-character hash printed from **Machine A**:
 ```
 
 *Expected output:*
-
 ```text
 [receiver] ingress server listening on 0.0.0.0:9000
 [receiver] status server listening on 127.0.0.1:9101
@@ -107,7 +95,6 @@ Replace `<RECEIVER_IP>` and `<RECEIVER_FP>` with the values from **Machine B**:
 ```
 
 *Expected output:*
-
 ```text
 [sender] watching ./outbox, dispatching to <RECEIVER_IP>:9000 (parallel=1)
 [sender] status server listening on 127.0.0.1:9100
@@ -122,7 +109,7 @@ Replace `<RECEIVER_IP>` and `<RECEIVER_FP>` with the values from **Machine B**:
 Open a **new terminal tab** in the same directory:
 
 ```bash
-# Create a 20MB random payload under temporary naming
+# Create a 20MB random payload
 dd if=/dev/urandom of=outbox/.test_shard.tar.tmp bs=1M count=20
 
 # Calculate and display the original SHA-256 hash
@@ -135,13 +122,18 @@ mv outbox/.test_shard.tar.tmp outbox/test_shard.tar
 
 #### 2. Verify on Machine B (Receiver)
 
-Once Machine A shows the file archived to `outbox/.sent/test_shard.tar`, check Machine B:
+Once Machine A shows the file archived to `outbox/.sent/test_shard.tar`, verify on Machine B:
 
 ```bash
 sha256sum incoming/test_shard.tar
 ```
 
 The output hash on Machine B will match the expected hash displayed on Machine A.
+
+> **Tip**: If you ever need to inspect an existing certificate's fingerprint again without regenerating keys:
+> ```bash
+> openssl x509 -in keys/<name>.crt -outform DER | sha256sum | awk '{print $1}'
+> ```
 
 ---
 
