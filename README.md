@@ -142,7 +142,7 @@ The output hash on Machine B will match the expected hash displayed on Machine A
 | Command | Primary Flags | Description |
 |---|---|---|
 | `keygen` | `-name <prefix>`, `-days <int>` | Generate ECDSA P-256 keypair and print SHA-256 fingerprint |
-| `recv` | `-dir <path>`, `-listen <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>` | Run receiver daemon with mTLS and atomic commit |
+| `recv` | `-dir <path>`, `-listen <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-collision <rename\|reject\|overwrite>` | Run receiver daemon with mTLS and atomic commit |
 | `send` | `-dir <path>`, `-addr <addr>`, `-cert <path>`, `-key <path>`, `-peer-fp <fp>`, `-after <archive\|delete>` | Watch directory and stream files to receiver |
 | `monitor` | `-targets <addr@fp,...>`, `-cert <path>`, `-key <path>`, `-watch <interval>` | Poll node diagnostics and render terminal dashboard |
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"xport/internal/wire"
 )
@@ -15,7 +16,7 @@ import (
 // 3. os.Rename(stagedPath, targetPath) to atomically place into incoming folder
 // 4. dir.Sync() to persist directory inode block updates
 // 5. Transmit 0x00 ACK to the sender
-func CommitBarrier(stagedFile *os.File, stagedPath, incomingDir, filename string, conn io.Writer) error {
+func CommitBarrier(stagedFile *os.File, stagedPath, incomingDir, filename, collisionPolicy string, conn io.Writer) error {
 	// 1. Sync staged file
 	if err := stagedFile.Sync(); err != nil {
 		_ = stagedFile.Close()
@@ -29,8 +30,23 @@ func CommitBarrier(stagedFile *os.File, stagedPath, incomingDir, filename string
 		return fmt.Errorf("failed to close staged file: %w", err)
 	}
 
-	// 3. Atomic rename to target path in incoming directory
+	// Handle collision if target already exists
 	targetPath := filepath.Join(incomingDir, filename)
+	if _, err := os.Stat(targetPath); err == nil {
+		switch collisionPolicy {
+		case "reject":
+			_ = os.Remove(stagedPath)
+			return fmt.Errorf("file %q already exists in destination", filename)
+		case "overwrite":
+			// Proceed with standard atomic overwrite
+		case "rename":
+			fallthrough
+		default:
+			targetPath = filepath.Join(incomingDir, fmt.Sprintf("%s.%d", filename, time.Now().UnixNano()))
+		}
+	}
+
+	// 3. Atomic rename to target path in incoming directory
 	if err := os.Rename(stagedPath, targetPath); err != nil {
 		_ = os.Remove(stagedPath)
 		return fmt.Errorf("failed to atomically rename staged file: %w", err)

@@ -166,6 +166,7 @@ func runRecv(args []string) {
 	staleAfter := fs.Duration("stale-after", 0, "Duration without commits before WARN (0 = disabled)")
 	diskWarnPct := fs.Int("disk-warn-pct", 15, "Free space warning threshold")
 	diskFailPct := fs.Int("disk-fail-pct", 5, "Free space critical failure threshold")
+	collision := fs.String("collision", "rename", "Collision policy if destination file exists: rename, reject, overwrite")
 	_ = fs.Parse(args)
 
 	if *cert == "" || *key == "" || *peerFP == "" {
@@ -202,11 +203,12 @@ func runRecv(args []string) {
 	log.Printf("[receiver] status server listening on %s", *statusAddr)
 
 	recvServer := receiver.NewServer(*dir, *listen, *cert, *key, allowedFPs, maxSize, tracker)
+	recvServer.SetCollisionPolicy(*collision)
 	if err := recvServer.Start(); err != nil {
 		log.Fatalf("failed to start receiver ingress server: %v", err)
 	}
 	defer recvServer.Close()
-	log.Printf("[receiver] ingress server listening on %s (commit dir=%s)", *listen, *dir)
+	log.Printf("[receiver] ingress server listening on %s (commit dir=%s, collision=%s)", *listen, *dir, *collision)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

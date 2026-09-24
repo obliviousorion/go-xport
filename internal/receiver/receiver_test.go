@@ -58,7 +58,7 @@ func TestCommitBarrier(t *testing.T) {
 	filename := "checkpoint-001.bin"
 	var replyBuf bytes.Buffer
 
-	if err := CommitBarrier(stagedFile, stagedPath, tempDir, filename, &replyBuf); err != nil {
+	if err := CommitBarrier(stagedFile, stagedPath, tempDir, filename, "rename", &replyBuf); err != nil {
 		t.Fatalf("CommitBarrier failed: %v", err)
 	}
 
@@ -80,6 +80,49 @@ func TestCommitBarrier(t *testing.T) {
 	// Verify staging file was renamed away
 	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
 		t.Errorf("staging file still exists at %s", stagedPath)
+	}
+}
+
+func TestCommitBarrierCollision(t *testing.T) {
+	tempDir := t.TempDir()
+	filename := "existing.bin"
+	origPath := filepath.Join(tempDir, filename)
+	_ = os.WriteFile(origPath, []byte("original"), 0644)
+
+	// Test 1: reject policy
+	stagedFile1, stagedPath1, _ := CreateStagedFile(tempDir)
+	_, _ = stagedFile1.Write([]byte("duplicate"))
+	var replyBuf1 bytes.Buffer
+	err := CommitBarrier(stagedFile1, stagedPath1, tempDir, filename, "reject", &replyBuf1)
+	if err == nil {
+		t.Fatalf("expected error on collision with reject policy")
+	}
+
+	// Test 2: rename policy
+	stagedFile2, stagedPath2, _ := CreateStagedFile(tempDir)
+	_, _ = stagedFile2.Write([]byte("renamed-version"))
+	var replyBuf2 bytes.Buffer
+	err = CommitBarrier(stagedFile2, stagedPath2, tempDir, filename, "rename", &replyBuf2)
+	if err != nil {
+		t.Fatalf("unexpected error on collision with rename policy: %v", err)
+	}
+	// Check that original still exists with original content
+	data, _ := os.ReadFile(origPath)
+	if string(data) != "original" {
+		t.Fatalf("original file was corrupted: %s", string(data))
+	}
+
+	// Test 3: overwrite policy
+	stagedFile3, stagedPath3, _ := CreateStagedFile(tempDir)
+	_, _ = stagedFile3.Write([]byte("overwritten"))
+	var replyBuf3 bytes.Buffer
+	err = CommitBarrier(stagedFile3, stagedPath3, tempDir, filename, "overwrite", &replyBuf3)
+	if err != nil {
+		t.Fatalf("unexpected error on collision with overwrite policy: %v", err)
+	}
+	data, _ = os.ReadFile(origPath)
+	if string(data) != "overwritten" {
+		t.Fatalf("expected overwritten content, got: %s", string(data))
 	}
 }
 

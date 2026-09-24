@@ -24,6 +24,7 @@ type Server struct {
 	keyFile           string
 	allowedSenderFPs  []string
 	maxSize           uint64
+	collisionPolicy   string
 	tracker           *monitor.Tracker
 	listener          net.Listener
 	activeConnCount   int32
@@ -43,10 +44,15 @@ func NewServer(incomingDir, listenAddr, certFile, keyFile string, allowedSenderF
 		keyFile:          keyFile,
 		allowedSenderFPs: allowedSenderFPs,
 		maxSize:          maxSize,
+		collisionPolicy:  "rename",
 		tracker:          tracker,
 		stopCh:           make(chan struct{}),
 		conns:            make(map[net.Conn]struct{}),
 	}
+}
+
+func (s *Server) SetCollisionPolicy(policy string) {
+	s.collisionPolicy = policy
 }
 
 func (s *Server) Start() error {
@@ -219,7 +225,7 @@ func (s *Server) handleConnection(c net.Conn) {
 		// 3. os.Rename(stagedPath, targetPath)
 		// 4. dir.Sync()
 		// 5. Send 0x00 ACK
-		err = CommitBarrier(stagedFile, stagedPath, s.incomingDir, filename, deadlineConn)
+		err = CommitBarrier(stagedFile, stagedPath, s.incomingDir, filename, s.collisionPolicy, deadlineConn)
 		if err != nil {
 			log.Printf("[receiver] commit barrier error for %s: %v", filename, err)
 			_ = wire.WriteNack(deadlineConn, fmt.Sprintf("commit barrier failure: %v", err))
