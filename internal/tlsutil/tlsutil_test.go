@@ -123,3 +123,20 @@ func TestCertGenerationAndPinning(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateCertCreatesDirectories(t *testing.T) {
+	tempDir := t.TempDir()
+	nestedCertPath := filepath.Join(tempDir, "deep", "nested", "keys", "node.crt")
+	nestedKeyPath := filepath.Join(tempDir, "deep", "nested", "keys", "node.key")
+
+	fp, err := GenerateCert("node", 365, nestedCertPath, nestedKeyPath)
+	if err != nil {
+		t.Fatalf("GenerateCert failed to create nested directories: %v", err)
+	}
+	if len(fp) != 64 {
+		t.Fatalf("invalid fingerprint length: %d", len(fp))
+	}
+	if _, err := os.Stat(nestedCertPath); err != nil {
+		t.Fatalf("nested cert was not created: %v", err)
+	}
+}

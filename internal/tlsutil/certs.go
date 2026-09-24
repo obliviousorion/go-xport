@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -62,6 +63,18 @@ func GenerateCert(name string, days int, certPath, keyPath string) (string, erro
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privKey.PublicKey, privKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to create certificate: %w", err)
+	}
+
+	// Ensure parent directories exist
+	if certDir := filepath.Dir(certPath); certDir != "" {
+		if err := os.MkdirAll(certDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create directory %s: %w", certDir, err)
+		}
+	}
+	if keyDir := filepath.Dir(keyPath); keyDir != "" {
+		if err := os.MkdirAll(keyDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create directory %s: %w", keyDir, err)
+		}
 	}
 
 	// Write certificate PEM

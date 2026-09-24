@@ -81,6 +81,7 @@ start_receiver() {
         -cert "$KEYS_DIR/receiver.crt" -key "$KEYS_DIR/receiver.key" \
         -peer-fp "$SENDER_FP" -name "recv-A" \
         -max-size "64GiB" \
+        -disk-warn-pct 0 -disk-fail-pct 0 \
         -status "$RECV_STATUS" &
     RECV_PID=$!
     sleep 1
@@ -98,6 +99,7 @@ start_sender() {
         -cert "$KEYS_DIR/sender.crt" -key "$KEYS_DIR/sender.key" \
         -peer-fp "$RECEIVER_FP" -parallel 1 -after archive \
         -scan 200ms -max-attempts 10 -stall-after 3s \
+        -disk-warn-pct 0 -disk-fail-pct 0 \
         -name "send-A" -status "$SEND_STATUS" &
     SEND_PID=$!
     sleep 1
@@ -227,6 +229,7 @@ wait "$RECV_PID" 2>/dev/null || true
     -cert "$KEYS_DIR/receiver.crt" -key "$KEYS_DIR/receiver.key" \
     -peer-fp "$SENDER_FP" -name "recv-A" \
     -max-size "500B" \
+    -disk-warn-pct 0 -disk-fail-pct 0 \
     -status "$RECV_STATUS" &
 RECV_PID=$!
 sleep 1
