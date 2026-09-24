@@ -31,10 +31,11 @@ type Scanner struct {
 	interval time.Duration
 	queue    *Queue
 
-	mu       sync.Mutex
-	states   map[string]*fileScanState
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	mu            sync.Mutex
+	states        map[string]*fileScanState
+	ignoredWarned map[string]struct{}
+	stopCh        chan struct{}
+	stopOnce      sync.Once
 }
 
 func NewScanner(watchDir string, interval time.Duration, queue *Queue) *Scanner {
@@ -42,11 +43,12 @@ func NewScanner(watchDir string, interval time.Duration, queue *Queue) *Scanner 
 		interval = 1 * time.Second
 	}
 	return &Scanner{
-		watchDir: watchDir,
-		interval: interval,
-		queue:    queue,
-		states:   make(map[string]*fileScanState),
-		stopCh:   make(chan struct{}),
+		watchDir:      watchDir,
+		interval:      interval,
+		queue:         queue,
+		states:        make(map[string]*fileScanState),
+		ignoredWarned: make(map[string]struct{}),
+		stopCh:        make(chan struct{}),
 	}
 }
 
@@ -104,6 +106,13 @@ func (s *Scanner) scanOnce() {
 
 		// Reject files ending in .tmp or .part or invalid filename
 		if err := wire.ValidateFilename(name); err != nil {
+			if !strings.HasSuffix(name, ".tmp") && !strings.HasSuffix(name, ".part") {
+				if _, warned := s.ignoredWarned[name]; !warned {
+					log.Printf("[scanner] WARN: ignoring file %q with invalid name format: %v", name, err)
+					s.ignoredWarned[name] = struct{}{}
+				}
+				currentFiles[name] = struct{}{}
+			}
 			continue
 		}
 
@@ -151,6 +160,11 @@ func (s *Scanner) scanOnce() {
 	for name := range s.states {
 		if _, ok := currentFiles[name]; !ok {
 			delete(s.states, name)
+		}
+	}
+	for name := range s.ignoredWarned {
+		if _, ok := currentFiles[name]; !ok {
+			delete(s.ignoredWarned, name)
 		}
 	}
 	s.mu.Unlock()
